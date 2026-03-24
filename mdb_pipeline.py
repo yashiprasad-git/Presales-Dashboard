@@ -200,41 +200,62 @@ def _monday_post(api_key: str, query: str, variables: Dict[str, Any]) -> Dict[st
 
 
 def fetch_done_items(api_key: str, board_id: str, col_ids: List[str]) -> List[Dict[str, Any]]:
-    """Fetch items with status 'Done' from a Monday board (paginated)."""
+    """Fetch items with status 'Done' from a Monday board (paginated).
+    Monday API requires query_params only on the first page and cursor only on subsequent pages.
+    """
     col_ids_gql = ", ".join(f'"{c}"' for c in col_ids)
 
-    def _fetch_by(compare_value: str) -> List[Dict[str, Any]]:
-        query = f"""
-        query($board_id: ID!, $limit: Int!, $cursor: String) {{
-          boards(ids: [$board_id]) {{
-            items_page(limit: $limit, cursor: $cursor, query_params: {{
-              rules: [{{ column_id: "color_mkqjerxs",
-                         compare_value: [{compare_value}],
-                         operator: any_of }}]
-            }}) {{
-              cursor
-              items {{
-                id name updated_at created_at
-                column_values(ids: [{col_ids_gql}]) {{
-                  id text value type
-                }}
-              }}
+    first_page_query = f"""
+    query($board_id: ID!, $limit: Int!) {{
+      boards(ids: [$board_id]) {{
+        items_page(limit: $limit, query_params: {{
+          rules: [{{ column_id: "color_mkqjerxs",
+                     compare_value: [COMPARE_VALUE],
+                     operator: any_of }}]
+        }}) {{
+          cursor
+          items {{
+            id name updated_at created_at
+            column_values(ids: [{col_ids_gql}]) {{
+              id text value type
             }}
           }}
-        }}"""
-        items: List[Dict[str, Any]] = []
-        cursor: Optional[str] = None
-        while True:
-            data = _monday_post(api_key, query,
-                                {"board_id": board_id, "limit": 100, "cursor": cursor})
-            page = data["boards"][0]["items_page"]
+        }}
+      }}
+    }}"""
+
+    next_page_query = f"""
+    query($cursor: String!, $limit: Int!) {{
+      next_items_page(limit: $limit, cursor: $cursor) {{
+        cursor
+        items {{
+          id name updated_at created_at
+          column_values(ids: [{col_ids_gql}]) {{
+            id text value type
+          }}
+        }}
+      }}
+    }}"""
+
+    def _fetch_by(compare_value: str) -> List[Dict[str, Any]]:
+        # First page — use query_params with status filter
+        q = first_page_query.replace("COMPARE_VALUE", compare_value)
+        data = _monday_post(api_key, q, {"board_id": board_id, "limit": 100})
+        page = data["boards"][0]["items_page"]
+        items: List[Dict[str, Any]] = list(page["items"])
+        cursor = page.get("cursor")
+
+        # Subsequent pages — use cursor only (no query_params)
+        while cursor:
+            data = _monday_post(api_key, next_page_query,
+                                {"cursor": cursor, "limit": 100})
+            page = data["next_items_page"]
             items.extend(page["items"])
             cursor = page.get("cursor")
-            if not cursor:
-                break
+
         return items
 
-    # Try by index first (1 = Done), fall back to label
+    # Try by index first (1 = Done), fall back to label "Done"
     items = _fetch_by("1")
     if not items:
         items = _fetch_by('"Done"')
