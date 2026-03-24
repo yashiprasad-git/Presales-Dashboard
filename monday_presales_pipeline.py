@@ -170,58 +170,73 @@ def monday_graphql(api_key: str, query: str, variables: Dict[str, Any]) -> Dict[
     return payload["data"]
 
 
+MONDAY_ITEM_URL = "https://silverpush-global.monday.com/boards/{board_id}/pulses/{item_id}"
+
+
 def fetch_board_items(api_key: str, board_id: int, limit: int = 500) -> List[Dict[str, Any]]:
     """
     Uses Monday's items_page pagination (cursor).
-    Returns list of items, each with name and column_values (id,text,value).
+    Returns list of items, each with id, name, created_at, group, and column_values.
+    Note: query_params and cursor cannot be combined — use separate first-page and
+    next-page queries.
     """
-    query = """
-    query ($board_id: ID!, $limit: Int!, $cursor: String) {
+    first_page_query = """
+    query ($board_id: ID!, $limit: Int!) {
       boards(ids: [$board_id]) {
-        items_page(limit: $limit, cursor: $cursor) {
+        items_page(limit: $limit) {
           cursor
           items {
+            id
             name
             created_at
-            group {
-              title
-            }
-            column_values {
-              id
-              text
-              value
-              type
-            }
+            group { title }
+            column_values { id text value type }
           }
         }
       }
     }
     """
+    next_page_query = """
+    query ($cursor: String!, $limit: Int!) {
+      next_items_page(limit: $limit, cursor: $cursor) {
+        cursor
+        items {
+          id
+          name
+          created_at
+          group { title }
+          column_values { id text value type }
+        }
+      }
+    }
+    """
     items: List[Dict[str, Any]] = []
-    cursor: Optional[str] = None
-    while True:
-        data = monday_graphql(
-            api_key,
-            query,
-            {"board_id": board_id, "limit": limit, "cursor": cursor},
-        )
-        page = data["boards"][0]["items_page"]
+
+    # First page
+    data = monday_graphql(api_key, first_page_query, {"board_id": board_id, "limit": limit})
+    page = data["boards"][0]["items_page"]
+    items.extend(page["items"])
+    cursor = page.get("cursor")
+
+    # Subsequent pages
+    while cursor:
+        data = monday_graphql(api_key, next_page_query, {"cursor": cursor, "limit": limit})
+        page = data["next_items_page"]
         items.extend(page["items"])
         cursor = page.get("cursor")
-        if not cursor:
-            break
+
     return items
 
 
 def board_items_to_presales_df(items: List[Dict[str, Any]], cfg: BoardConfig) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     for item in items:
-        # Only process items in the "In progress" group on the board.
+        # Only process items in the "Done" group on the board.
         group_title = ""
         group_obj = item.get("group")
         if isinstance(group_obj, dict):
             group_title = str(group_obj.get("title", "")).strip()
-        if group_title.lower() != "in progress":
+        if group_title.lower() != "done":
             continue
 
         def _format_monday_value(cv: Dict[str, Any]) -> str:
@@ -331,6 +346,9 @@ def board_items_to_presales_df(items: List[Dict[str, Any]], cfg: BoardConfig) ->
         row: Dict[str, Any] = {c: "" for c in PRESALES_COLUMNS}
         row["Name"] = item.get("name", "") or ""
         row["Monday_Submitted_At"] = item.get("created_at", "") or ""
+        item_id = str(item.get("id", "") or "")
+        row["Monday_Item_ID"] = item_id
+        row["Monday_URL"] = MONDAY_ITEM_URL.format(board_id=cfg.board_id, item_id=item_id) if item_id else ""
 
         # Fill mapped columns (show product field as-is from Monday; do not auto-fill blank).
         for presales_col, monday_col_id in cfg.column_id_map.items():
@@ -355,8 +373,8 @@ def board_items_to_presales_df(items: List[Dict[str, Any]], cfg: BoardConfig) ->
 
         rows.append(row)
 
-    # Keep the standard presales columns plus the Monday submitted timestamp
-    df = pd.DataFrame(rows, columns=PRESALES_COLUMNS + ["Monday_Submitted_At"])
+    # Keep the standard presales columns plus extra metadata columns
+    df = pd.DataFrame(rows, columns=PRESALES_COLUMNS + ["Monday_Submitted_At", "Monday_Item_ID", "Monday_URL"])
 
     # Clean: remove rows where EVERYTHING is blank (including Name).
     # Keep rows with a campaign Name even if other columns are not mapped yet.

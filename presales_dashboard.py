@@ -134,6 +134,9 @@ def init_db(conn) -> None:
             ON results(run_id, region);
             """
         )
+        # Add monday_url column to existing tables if not present
+        cur.execute("ALTER TABLE results ADD COLUMN IF NOT EXISTS monday_url TEXT;")
+        cur.execute("ALTER TABLE alerts  ADD COLUMN IF NOT EXISTS monday_url TEXT;")
     conn.commit()
 
 
@@ -220,6 +223,7 @@ def extract_rows_from_workbook(path: Path) -> List[Dict[str, Any]]:
         c_p3 = col("P3_Channel_Count", "P3 Channel Count")
         c_status = col("Inventory_Status", "Inventory Status")
         c_err = col("Error_Log", "Error Log")
+        c_monday_url = col("Monday_URL", "Monday URL")
 
         for _, r in df.iterrows():
             status = (cell_str(r.get(c_status, "")) if c_status else "").strip()
@@ -243,6 +247,7 @@ def extract_rows_from_workbook(path: Path) -> List[Dict[str, Any]]:
                     "p3_channel_count": safe_int(r.get(c_p3)) if c_p3 else None,
                     "inventory_status": status,
                     "error_log": cell_str(r.get(c_err, "")) if c_err else "",
+                    "monday_url": cell_str(r.get(c_monday_url, "")) if c_monday_url else "",
                 }
             )
     return rows
@@ -285,8 +290,8 @@ def insert_results(conn, run_id: str, rows: List[Dict[str, Any]]) -> None:
               run_id, region, campaign_name, brand_name, vertical, country, derived_language,
               products_to_pitch, monday_run_dates, monday_submitted_at_utc, recommended_category,
               available_inventory_count, p1_channel_count, p2_channel_count, p3_channel_count,
-              inventory_status, error_log, inserted_at_utc
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+              inventory_status, error_log, monday_url, inserted_at_utc
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             [
                 (
@@ -296,7 +301,7 @@ def insert_results(conn, run_id: str, rows: List[Dict[str, Any]]) -> None:
                     r.get("monday_submitted_at_utc"), r.get("recommended_category"),
                     r.get("available_inventory_count"), r.get("p1_channel_count"),
                     r.get("p2_channel_count"), r.get("p3_channel_count"),
-                    r.get("inventory_status"), r.get("error_log"), now,
+                    r.get("inventory_status"), r.get("error_log"), r.get("monday_url"), now,
                 )
                 for r in rows
             ],
@@ -331,14 +336,14 @@ def insert_alerts(conn, rows: List[Dict[str, Any]]) -> int:
         if open_alert_exists(conn, r):
             continue
         with conn.cursor() as cur:
-            cur.execute(
+                cur.execute(
                 """
                 INSERT INTO alerts(
                   region, campaign_name, brand_name, country, derived_language,
                   products_to_pitch, monday_run_dates, monday_submitted_at_utc, recommended_category,
                   inventory_status, p1_channel_count, p2_channel_count, p3_channel_count,
-                  available_inventory_count, error_log, date_flagged_utc
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                  available_inventory_count, error_log, monday_url, date_flagged_utc
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 (
                     r["region"], r.get("campaign_name"), r.get("brand_name"), r.get("country"),
@@ -346,7 +351,7 @@ def insert_alerts(conn, rows: List[Dict[str, Any]]) -> int:
                     r.get("monday_submitted_at_utc"), r.get("recommended_category"),
                     status, r.get("p1_channel_count"), r.get("p2_channel_count"),
                     r.get("p3_channel_count"), r.get("available_inventory_count"),
-                    r.get("error_log"), now,
+                    r.get("error_log"), r.get("monday_url"), now,
                 ),
             )
         inserted += 1
@@ -411,6 +416,18 @@ def run_pipeline_and_ingest(config_path: Path, inventory_path: Path) -> Tuple[st
     insert_alerts(conn, rows)
     conn.close()
 
+    # Also run MDB pipeline (context rows) — best effort, don't fail the main run
+    if MDB_PIPELINE_SCRIPT.exists():
+        try:
+            mdb_env = env.copy()
+            subprocess.run(
+                [sys.executable, str(MDB_PIPELINE_SCRIPT), str(config_path)],
+                cwd=str(PRESALES_DIR), capture_output=True, text=True, env=mdb_env,
+                timeout=300,
+            )
+        except Exception:
+            pass  # MDB pipeline failure should not block the main pipeline result
+
     return run_id, status
 
 
@@ -432,7 +449,7 @@ def fetch_open_alerts(conn) -> pd.DataFrame:
         SELECT alert_id, region, campaign_name, brand_name, country, derived_language,
                products_to_pitch, monday_run_dates, monday_submitted_at_utc, recommended_category,
                inventory_status, p1_channel_count, p2_channel_count, p3_channel_count,
-               available_inventory_count, error_log, date_flagged_utc
+               available_inventory_count, error_log, monday_url, date_flagged_utc
         FROM alerts
         WHERE resolved_at_utc IS NULL
         ORDER BY date_flagged_utc DESC
@@ -448,7 +465,7 @@ def fetch_resolved_alerts(conn) -> pd.DataFrame:
         SELECT alert_id, region, campaign_name, brand_name, country, derived_language,
                products_to_pitch, monday_run_dates, monday_submitted_at_utc, recommended_category,
                inventory_status, p1_channel_count, p2_channel_count, p3_channel_count,
-               available_inventory_count, error_log, date_flagged_utc,
+               available_inventory_count, error_log, monday_url, date_flagged_utc,
                resolved_at_utc, resolved_by, resolved_note
         FROM alerts
         WHERE resolved_at_utc IS NOT NULL
@@ -477,12 +494,12 @@ def fetch_all_results(conn, days: Optional[int] = 30, older: bool = False) -> pd
         SELECT run_inserted_at_utc, run_id, region, campaign_name, brand_name, vertical, country,
                derived_language, products_to_pitch, monday_run_dates, recommended_category,
                p1_channel_count, p2_channel_count, p3_channel_count, available_inventory_count,
-               inventory_status, error_log
+               inventory_status, error_log, monday_url
         FROM (
           SELECT r.inserted_at_utc AS run_inserted_at_utc, r.run_id, r.region, r.campaign_name,
                  r.brand_name, r.vertical, r.country, r.derived_language, r.products_to_pitch,
                  r.monday_run_dates, r.recommended_category, r.p1_channel_count, r.p2_channel_count,
-                 r.p3_channel_count, r.available_inventory_count, r.inventory_status, r.error_log,
+                 r.p3_channel_count, r.available_inventory_count, r.inventory_status, r.error_log, r.monday_url,
                  ROW_NUMBER() OVER (
                    PARTITION BY r.region, COALESCE(r.campaign_name,''), COALESCE(r.brand_name,'')
                    ORDER BY r.inserted_at_utc DESC
@@ -537,27 +554,6 @@ def last_updated(conn) -> Optional[str]:
         row = cur.fetchone()
     return row[0] if row and row[0] else None
 
-
-def run_mdb_pipeline(config_path: Path) -> Tuple[str, str]:
-    """Run mdb_pipeline.py as a subprocess and return (stdout, stderr)."""
-    if not MDB_PIPELINE_SCRIPT.exists():
-        raise RuntimeError(f"Missing MDB pipeline script: {MDB_PIPELINE_SCRIPT}")
-    monday_key = os.getenv("MONDAY_API_KEY") or st.secrets.get("MONDAY_API_KEY", "")  # type: ignore[attr-defined]
-    db_url = os.getenv("DATABASE_URL") or st.secrets.get("DATABASE_URL", "")  # type: ignore[attr-defined]
-    if not monday_key:
-        raise RuntimeError("MONDAY_API_KEY is not set.")
-    if not db_url:
-        raise RuntimeError("DATABASE_URL is not set.")
-    env = os.environ.copy()
-    env["MONDAY_API_KEY"] = monday_key
-    env["DATABASE_URL"] = db_url
-    proc = subprocess.run(
-        [sys.executable, str(MDB_PIPELINE_SCRIPT), str(config_path)],
-        cwd=str(PRESALES_DIR), capture_output=True, text=True, env=env,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr or proc.stdout or "MDB pipeline failed.")
-    return proc.stdout or "", proc.stderr or ""
 
 
 def fetch_context_rows(conn) -> pd.DataFrame:
@@ -647,8 +643,7 @@ def main() -> None:
         st.write("`DATABASE_URL`:", "set" if (os.getenv("DATABASE_URL") or st.secrets.get("DATABASE_URL")) else "missing")  # type: ignore[attr-defined]
 
         st.divider()
-        run_clicked     = st.button("Run Presales Pipeline", type="primary", use_container_width=True)
-        run_mdb_clicked = st.button("Run MDB Pipeline", use_container_width=True)
+        run_clicked = st.button("Run Pipeline", type="primary", use_container_width=True)
 
     if run_clicked:
         try:
@@ -659,21 +654,9 @@ def main() -> None:
         except Exception as e:
             st.error(str(e))
 
-    if run_mdb_clicked:
-        try:
-            with st.spinner("Running MDB pipeline… reading media plans from Google Sheets."):
-                stdout, _ = run_mdb_pipeline(Path(config_path))
-            st.success("MDB pipeline complete.")
-            if stdout:
-                with st.expander("Pipeline output"):
-                    st.text(stdout)
-            st.rerun()
-        except Exception as e:
-            st.error(str(e))
-
-    tab_alerts, tab_resolved, tab_all_30d, tab_all_old, tab_context, tab_blocked = st.tabs(
+    tab_alerts, tab_resolved, tab_all_30d, tab_all_old, tab_blocked = st.tabs(
         ["Open Alerts", "Resolved Alerts", "All Results (Last 30 days)",
-         "Older Campaigns", "Context List", "Access Blocked"]
+         "Older Campaigns", "Access Blocked"]
     )
 
     with tab_alerts:
@@ -701,7 +684,7 @@ def main() -> None:
         if filtered.empty:
             st.info("No open alerts.")
         else:
-            widths = [2, 2, 2, 2, 2.2, 3, 1.6, 1.8]
+            widths = [1.8, 1.8, 1.8, 1.8, 2.2, 2.8, 1.5, 1, 1.6]
             header = st.columns(widths)
             header[0].markdown("**Region**")
             header[1].markdown("**Brand**")
@@ -710,7 +693,8 @@ def main() -> None:
             header[4].markdown("**Run dates (Monday)**")
             header[5].markdown("**Recommended Category**")
             header[6].markdown("**Status**")
-            header[7].markdown("**Resolve**")
+            header[7].markdown("**Campaign**")
+            header[8].markdown("**Resolve**")
 
             row_by_id = {int(r["alert_id"]): r for _, r in filtered.iterrows()}
 
@@ -724,8 +708,13 @@ def main() -> None:
                 cols[4].write(row.get("monday_run_dates", "") or "")
                 cols[5].write(row.get("recommended_category", ""))
                 cols[6].write(row.get("inventory_status", ""))
+                m_url = row.get("monday_url", "") or ""
+                if m_url:
+                    cols[7].markdown(f"[Open]({m_url})")
+                else:
+                    cols[7].write("—")
 
-                if cols[7].button("Resolve", key=f"open_resolve_{alert_id}", use_container_width=True):
+                if cols[8].button("Resolve", key=f"open_resolve_{alert_id}", use_container_width=True):
                     st.session_state["resolve_alert_id"] = alert_id
                     st.rerun()
 
@@ -781,12 +770,15 @@ def main() -> None:
         else:
             df_r = df_r.fillna("")
             st.write(f"Resolved alerts: **{len(df_r)}**")
-            st.dataframe(df_r, use_container_width=True, height=600)
+            res_col_cfg = {}
+            if "monday_url" in df_r.columns:
+                res_col_cfg["monday_url"] = st.column_config.LinkColumn("Monday Link", display_text="Open")
+            st.dataframe(df_r, use_container_width=True, height=600, column_config=res_col_cfg)
 
     with tab_all_30d:
         df_all = fetch_all_results(conn, days=30, older=False)
         if df_all.empty:
-            st.info("No results in the last 30 days. Click **Run Pipeline** to generate results.")
+            st.info("No results in the last 30 days. Click **Run Pipeline** in the sidebar to generate results.")
         else:
             df_all = df_all.fillna("")
             regions_all = ["All"] + sorted([r for r in df_all["region"].dropna().unique().tolist() if r])
@@ -816,7 +808,10 @@ def main() -> None:
                 filtered_all = filtered_all[haystack.str.contains(search, na=False)]
 
             st.write(f"Rows shown: **{len(filtered_all)}** (Total history: **{len(df_all)}**)")
-            st.dataframe(filtered_all, use_container_width=True, height=600)
+            col_cfg = {}
+            if "monday_url" in filtered_all.columns:
+                col_cfg["monday_url"] = st.column_config.LinkColumn("Monday Link", display_text="Open")
+            st.dataframe(filtered_all, use_container_width=True, height=600, column_config=col_cfg)
 
     with tab_all_old:
         df_old = fetch_all_results(conn, days=30, older=True)
@@ -825,48 +820,10 @@ def main() -> None:
         else:
             df_old = df_old.fillna("")
             st.write(f"Older campaigns (older than 30 days): **{len(df_old)}**")
-            st.dataframe(df_old, use_container_width=True, height=600)
-
-    with tab_context:
-        df_ctx = fetch_context_rows(conn)
-        if df_ctx.empty:
-            st.info("No context rows yet. Click **Run MDB Pipeline** to fetch media plans.")
-        else:
-            st.write(f"Context rows: **{len(df_ctx)}**")
-
-            # Filters
-            fc1, fc2, fc3 = st.columns([1, 1, 2])
-            with fc1:
-                ctx_regions = ["All"] + sorted([r for r in df_ctx["region"].unique().tolist() if r])
-                ctx_region = st.selectbox("Region", ctx_regions, key="ctx_region")
-            with fc2:
-                ctx_langs = ["All"] + sorted([l for l in df_ctx["local_language"].unique().tolist() if l])
-                ctx_lang = st.selectbox("Local Language", ctx_langs, key="ctx_lang")
-            with fc3:
-                ctx_search = st.text_input("Search (campaign / brand / tactic / signal)",
-                                           key="ctx_search").strip().lower()
-
-            filtered_ctx = df_ctx.copy()
-            if ctx_region != "All":
-                filtered_ctx = filtered_ctx[filtered_ctx["region"] == ctx_region]
-            if ctx_lang != "All":
-                filtered_ctx = filtered_ctx[filtered_ctx["local_language"] == ctx_lang]
-            if ctx_search:
-                hay = (filtered_ctx[["campaign_name", "brand", "tactic_en", "signal_en",
-                                      "tactic_local", "signal_local"]]
-                       .fillna("").astype(str).agg(" ".join, axis=1).str.lower())
-                filtered_ctx = filtered_ctx[hay.str.contains(ctx_search, na=False)]
-
-            st.write(f"Showing: **{len(filtered_ctx)}**")
-
-            # Make Monday URL clickable
-            if "monday_url" in filtered_ctx.columns:
-                filtered_ctx["monday_url"] = filtered_ctx["monday_url"].apply(
-                    lambda u: f'<a href="{u}" target="_blank">Open</a>' if u else ""
-                )
-                st.write(filtered_ctx.to_html(escape=False, index=False), unsafe_allow_html=True)
-            else:
-                st.dataframe(filtered_ctx, use_container_width=True, height=600)
+            old_col_cfg = {}
+            if "monday_url" in df_old.columns:
+                old_col_cfg["monday_url"] = st.column_config.LinkColumn("Monday Link", display_text="Open")
+            st.dataframe(df_old, use_container_width=True, height=600, column_config=old_col_cfg)
 
     with tab_blocked:
         df_blk = fetch_access_blocked(conn)
@@ -919,7 +876,7 @@ def main() -> None:
                         )
                         if mp_url:
                             st.markdown(f"**Media plan:** [{mp_url}]({mp_url})")
-                        st.info("Share the media plan with **anyone with the link** (Viewer), then re-run MDB Pipeline.")
+                        st.info("Share the media plan with **anyone with the link** (Viewer), then re-run the Pipeline.")
                         blk_resolver = st.text_input("Your name", key=f"blk_by_{blk_target}")
                         blk_note = st.text_area("Resolution note (required)",
                                                 key=f"blk_note_{blk_target}", height=100)
