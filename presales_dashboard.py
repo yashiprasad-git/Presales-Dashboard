@@ -14,6 +14,8 @@ try:
 except ImportError:
     psycopg2 = None  # type: ignore
 
+MDB_PIPELINE_SCRIPT = Path(__file__).resolve().parent / "mdb_pipeline.py"
+
 
 APP_TITLE = "Presales Inventory Dashboard"
 PRESALES_DIR = Path(__file__).resolve().parent
@@ -496,11 +498,104 @@ def fetch_all_results(conn, days: Optional[int] = 30, older: bool = False) -> pd
     return _clean_products(df)
 
 
+def init_mdb_db(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS mdb_runs (
+              run_id TEXT PRIMARY KEY, started_at_utc TEXT NOT NULL,
+              finished_at_utc TEXT, status TEXT NOT NULL,
+              processed_count INTEGER DEFAULT 0, blocked_count INTEGER DEFAULT 0,
+              skipped_count INTEGER DEFAULT 0, failed_count INTEGER DEFAULT 0
+            );""")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS context_rows (
+              id SERIAL PRIMARY KEY, run_id TEXT, monday_item_id TEXT,
+              monday_board_id TEXT, monday_url TEXT, region TEXT,
+              campaign_name TEXT, brand TEXT, country TEXT, vertical TEXT,
+              brief TEXT, derived_language TEXT,
+              tactic_en TEXT, subtactic_en TEXT, signal_en TEXT,
+              tactic_local TEXT, subtactic_local TEXT, signal_local TEXT,
+              local_language TEXT, inserted_at_utc TEXT NOT NULL
+            );""")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS access_blocked (
+              id SERIAL PRIMARY KEY, run_id TEXT, monday_item_id TEXT,
+              monday_board_id TEXT, monday_url TEXT, region TEXT,
+              campaign_name TEXT, brand TEXT, country TEXT,
+              media_plan_url TEXT, error_message TEXT,
+              date_flagged_utc TEXT NOT NULL,
+              resolved_at_utc TEXT, resolved_by TEXT, resolved_note TEXT
+            );""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_context_campaign ON context_rows(region, campaign_name);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_blocked_open ON access_blocked(resolved_at_utc, region);")
+    conn.commit()
+
+
 def last_updated(conn) -> Optional[str]:
     with conn.cursor() as cur:
         cur.execute("SELECT MAX(inserted_at_utc) FROM results")
         row = cur.fetchone()
     return row[0] if row and row[0] else None
+
+
+def run_mdb_pipeline(config_path: Path) -> Tuple[str, str]:
+    """Run mdb_pipeline.py as a subprocess and return (stdout, stderr)."""
+    if not MDB_PIPELINE_SCRIPT.exists():
+        raise RuntimeError(f"Missing MDB pipeline script: {MDB_PIPELINE_SCRIPT}")
+    monday_key = os.getenv("MONDAY_API_KEY") or st.secrets.get("MONDAY_API_KEY", "")  # type: ignore[attr-defined]
+    db_url = os.getenv("DATABASE_URL") or st.secrets.get("DATABASE_URL", "")  # type: ignore[attr-defined]
+    if not monday_key:
+        raise RuntimeError("MONDAY_API_KEY is not set.")
+    if not db_url:
+        raise RuntimeError("DATABASE_URL is not set.")
+    env = os.environ.copy()
+    env["MONDAY_API_KEY"] = monday_key
+    env["DATABASE_URL"] = db_url
+    proc = subprocess.run(
+        [sys.executable, str(MDB_PIPELINE_SCRIPT), str(config_path)],
+        cwd=str(PRESALES_DIR), capture_output=True, text=True, env=env,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr or proc.stdout or "MDB pipeline failed.")
+    return proc.stdout or "", proc.stderr or ""
+
+
+def fetch_context_rows(conn) -> pd.DataFrame:
+    df = _df_from_query(
+        conn,
+        """SELECT region, campaign_name, brand, country, vertical,
+                  monday_url, derived_language, local_language,
+                  tactic_en, subtactic_en, signal_en,
+                  tactic_local, subtactic_local, signal_local,
+                  inserted_at_utc
+           FROM context_rows
+           ORDER BY inserted_at_utc DESC""",
+    )
+    return df.fillna("") if not df.empty else df
+
+
+def fetch_access_blocked(conn) -> pd.DataFrame:
+    df = _df_from_query(
+        conn,
+        """SELECT id, region, campaign_name, brand, country,
+                  monday_url, media_plan_url, error_message,
+                  date_flagged_utc, resolved_at_utc, resolved_by, resolved_note
+           FROM access_blocked
+           WHERE resolved_at_utc IS NULL
+           ORDER BY date_flagged_utc DESC""",
+    )
+    return df.fillna("") if not df.empty else df
+
+
+def resolve_blocked(conn, blocked_id: int, resolved_by: str = "", note: str = "") -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE access_blocked
+               SET resolved_at_utc=%s, resolved_by=%s, resolved_note=%s
+               WHERE id=%s""",
+            (utc_now_iso(), resolved_by.strip() or None, note.strip() or None, blocked_id),
+        )
+    conn.commit()
 
 
 def resolve_alert(conn, alert_id: int, resolved_by: str = "", note: str = "") -> None:
@@ -526,6 +621,7 @@ def main() -> None:
 
     conn = get_db()
     init_db(conn)
+    init_mdb_db(conn)
 
     if "resolve_alert_id" not in st.session_state:
         st.session_state["resolve_alert_id"] = None
@@ -551,7 +647,8 @@ def main() -> None:
         st.write("`DATABASE_URL`:", "set" if (os.getenv("DATABASE_URL") or st.secrets.get("DATABASE_URL")) else "missing")  # type: ignore[attr-defined]
 
         st.divider()
-        run_clicked = st.button("Run Pipeline", type="primary", use_container_width=True)
+        run_clicked     = st.button("Run Presales Pipeline", type="primary", use_container_width=True)
+        run_mdb_clicked = st.button("Run MDB Pipeline", use_container_width=True)
 
     if run_clicked:
         try:
@@ -562,8 +659,21 @@ def main() -> None:
         except Exception as e:
             st.error(str(e))
 
-    tab_alerts, tab_resolved, tab_all_30d, tab_all_old = st.tabs(
-        ["Open Alerts", "Resolved Alerts", "All Results (Last 30 days)", "Older Campaigns"]
+    if run_mdb_clicked:
+        try:
+            with st.spinner("Running MDB pipeline… reading media plans from Google Sheets."):
+                stdout, _ = run_mdb_pipeline(Path(config_path))
+            st.success("MDB pipeline complete.")
+            if stdout:
+                with st.expander("Pipeline output"):
+                    st.text(stdout)
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
+
+    tab_alerts, tab_resolved, tab_all_30d, tab_all_old, tab_context, tab_blocked = st.tabs(
+        ["Open Alerts", "Resolved Alerts", "All Results (Last 30 days)",
+         "Older Campaigns", "Context List", "Access Blocked"]
     )
 
     with tab_alerts:
@@ -716,6 +826,121 @@ def main() -> None:
             df_old = df_old.fillna("")
             st.write(f"Older campaigns (older than 30 days): **{len(df_old)}**")
             st.dataframe(df_old, use_container_width=True, height=600)
+
+    with tab_context:
+        df_ctx = fetch_context_rows(conn)
+        if df_ctx.empty:
+            st.info("No context rows yet. Click **Run MDB Pipeline** to fetch media plans.")
+        else:
+            st.write(f"Context rows: **{len(df_ctx)}**")
+
+            # Filters
+            fc1, fc2, fc3 = st.columns([1, 1, 2])
+            with fc1:
+                ctx_regions = ["All"] + sorted([r for r in df_ctx["region"].unique().tolist() if r])
+                ctx_region = st.selectbox("Region", ctx_regions, key="ctx_region")
+            with fc2:
+                ctx_langs = ["All"] + sorted([l for l in df_ctx["local_language"].unique().tolist() if l])
+                ctx_lang = st.selectbox("Local Language", ctx_langs, key="ctx_lang")
+            with fc3:
+                ctx_search = st.text_input("Search (campaign / brand / tactic / signal)",
+                                           key="ctx_search").strip().lower()
+
+            filtered_ctx = df_ctx.copy()
+            if ctx_region != "All":
+                filtered_ctx = filtered_ctx[filtered_ctx["region"] == ctx_region]
+            if ctx_lang != "All":
+                filtered_ctx = filtered_ctx[filtered_ctx["local_language"] == ctx_lang]
+            if ctx_search:
+                hay = (filtered_ctx[["campaign_name", "brand", "tactic_en", "signal_en",
+                                      "tactic_local", "signal_local"]]
+                       .fillna("").astype(str).agg(" ".join, axis=1).str.lower())
+                filtered_ctx = filtered_ctx[hay.str.contains(ctx_search, na=False)]
+
+            st.write(f"Showing: **{len(filtered_ctx)}**")
+
+            # Make Monday URL clickable
+            if "monday_url" in filtered_ctx.columns:
+                filtered_ctx["monday_url"] = filtered_ctx["monday_url"].apply(
+                    lambda u: f'<a href="{u}" target="_blank">Open</a>' if u else ""
+                )
+                st.write(filtered_ctx.to_html(escape=False, index=False), unsafe_allow_html=True)
+            else:
+                st.dataframe(filtered_ctx, use_container_width=True, height=600)
+
+    with tab_blocked:
+        df_blk = fetch_access_blocked(conn)
+        st.write(f"Access blocked (open): **{len(df_blk)}**")
+
+        if df_blk.empty:
+            st.info("No access-blocked media plans. All sheets were readable.")
+        else:
+            if "resolve_blocked_id" not in st.session_state:
+                st.session_state["resolve_blocked_id"] = None
+
+            blk_widths = [2, 2, 2, 3, 2, 1.5]
+            blk_header = st.columns(blk_widths)
+            blk_header[0].markdown("**Region**")
+            blk_header[1].markdown("**Campaign**")
+            blk_header[2].markdown("**Brand**")
+            blk_header[3].markdown("**Error**")
+            blk_header[4].markdown("**Flagged**")
+            blk_header[5].markdown("**Resolve**")
+
+            blk_by_id = {int(r["id"]): r for _, r in df_blk.iterrows()}
+
+            for _, row in df_blk.iterrows():
+                bid = int(row["id"])
+                cols = st.columns(blk_widths)
+                cols[0].write(row.get("region", ""))
+                name_cell = row.get("campaign_name", "") or ""
+                url = row.get("monday_url", "") or ""
+                cols[1].markdown(f'[{name_cell}]({url})' if url else name_cell)
+                cols[2].write(row.get("brand", ""))
+                cols[3].write(str(row.get("error_message", ""))[:120])
+                cols[4].write(str(row.get("date_flagged_utc", ""))[:10])
+                if cols[5].button("Resolve", key=f"blk_resolve_{bid}", use_container_width=True):
+                    st.session_state["resolve_blocked_id"] = bid
+                    st.rerun()
+
+            blk_target = st.session_state.get("resolve_blocked_id")
+            if blk_target:
+                blk_row = blk_by_id.get(int(blk_target))
+                if blk_row is None:
+                    st.session_state["resolve_blocked_id"] = None
+                else:
+                    with st.container(border=True):
+                        st.subheader("Resolve blocked access")
+                        mp_url = blk_row.get("media_plan_url", "") or ""
+                        st.caption(
+                            f"Campaign: {blk_row.get('campaign_name','')} | "
+                            f"Region: {blk_row.get('region','')} | "
+                            f"Error: {blk_row.get('error_message','')}"
+                        )
+                        if mp_url:
+                            st.markdown(f"**Media plan:** [{mp_url}]({mp_url})")
+                        st.info("Share the media plan with **anyone with the link** (Viewer), then re-run MDB Pipeline.")
+                        blk_resolver = st.text_input("Your name", key=f"blk_by_{blk_target}")
+                        blk_note = st.text_area("Resolution note (required)",
+                                                key=f"blk_note_{blk_target}", height=100)
+                        bc1, bc2 = st.columns([1, 1])
+                        with bc1:
+                            if st.button("Confirm resolve", type="primary",
+                                         use_container_width=True, key=f"blk_confirm_{blk_target}"):
+                                if not blk_resolver.strip():
+                                    st.error("Please enter your name.")
+                                elif not blk_note.strip():
+                                    st.error("Please enter a resolution note.")
+                                else:
+                                    resolve_blocked(conn, int(blk_target),
+                                                    resolved_by=blk_resolver, note=blk_note)
+                                    st.session_state["resolve_blocked_id"] = None
+                                    st.rerun()
+                        with bc2:
+                            if st.button("Cancel", use_container_width=True,
+                                         key=f"blk_cancel_{blk_target}"):
+                                st.session_state["resolve_blocked_id"] = None
+                                st.rerun()
 
     conn.close()
 
