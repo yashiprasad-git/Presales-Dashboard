@@ -895,13 +895,32 @@ def main() -> None:
         "--since",
         default=None,
         help="Only include campaigns created on/after this date (YYYY-MM-DD). "
-             f"Defaults to last successful run date, or {FIRST_RUN_SINCE} on first run.",
+             f"Defaults to {FIRST_RUN_SINCE} on first run.",
+    )
+    parser.add_argument(
+        "--skip-ids-file",
+        default=None,
+        dest="skip_ids_file",
+        help="Path to a JSON file containing a list of Monday item IDs to skip (already processed).",
     )
     args = parser.parse_args()
 
     config_path = args.config
     inventory_path = args.inventory
     since_date_str: str = args.since if args.since else FIRST_RUN_SINCE
+
+    # Load already-processed item IDs
+    skip_ids: set = set()
+    if args.skip_ids_file:
+        try:
+            import json as _json
+            with open(args.skip_ids_file, "r") as fh:
+                loaded = _json.load(fh)
+            skip_ids = {str(x) for x in loaded if x}
+            if skip_ids:
+                print(f"Skipping {len(skip_ids)} already-processed campaign(s).")
+        except Exception as e:
+            print(f"Warning: could not load skip-ids file: {e}")
 
     try:
         since_dt = datetime.strptime(since_date_str, "%Y-%m-%d")
@@ -934,6 +953,14 @@ def main() -> None:
         print(f"Fetching Monday board: {b.region}")
         items = fetch_board_items(monday_key, b.board_id)
         df = board_items_to_presales_df(items, b)
+
+        # Skip already-processed campaigns by Monday item ID
+        if skip_ids and "Monday_Item_ID" in df.columns and not df.empty:
+            before_skip = len(df)
+            df = df[~df["Monday_Item_ID"].isin(skip_ids)].reset_index(drop=True)
+            already_done = before_skip - len(df)
+            if already_done:
+                print(f"  Skipped {already_done} already-processed campaign(s) for {b.region}.")
 
         # Filter by since_date using the Monday_Submitted_At (created_at) column
         if "Monday_Submitted_At" in df.columns and not df.empty:

@@ -1,6 +1,8 @@
+import json
 import os
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -375,9 +377,19 @@ def _last_successful_run_date(conn) -> Optional[str]:
         )
         row = cur.fetchone()
     if row and row[0]:
-        # Return just the date portion (YYYY-MM-DD)
         return str(row[0])[:10]
     return None
+
+
+def _processed_item_ids(conn) -> List[str]:
+    """Return all Monday item IDs that have already been processed (stored in results)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT monday_item_id FROM results "
+            "WHERE monday_item_id IS NOT NULL AND monday_item_id <> ''"
+        )
+        rows = cur.fetchall()
+    return [str(r[0]) for r in rows if r[0]]
 
 
 def run_pipeline_and_ingest(config_path: Path, inventory_path: Path) -> Tuple[str, str]:
@@ -400,6 +412,15 @@ def run_pipeline_and_ingest(config_path: Path, inventory_path: Path) -> Tuple[st
     # Determine the since-date: last successful run date, or FIRST_RUN_SINCE on first run
     since_date = _last_successful_run_date(conn) or FIRST_RUN_SINCE
 
+    # Write already-processed item IDs to a temp file so the pipeline can skip them
+    skip_ids = _processed_item_ids(conn)
+    skip_ids_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False, dir=str(PRESALES_DIR)
+    )
+    json.dump(skip_ids, skip_ids_file)
+    skip_ids_file.close()
+    skip_ids_path = skip_ids_file.name
+
     insert_run(conn, run_id, started_at)
 
     before = set(p.name for p in PRESALES_DIR.glob(RECOMMENDATIONS_GLOB))
@@ -410,12 +431,18 @@ def run_pipeline_and_ingest(config_path: Path, inventory_path: Path) -> Tuple[st
 
     proc = subprocess.run(
         [sys.executable, str(PIPELINE_SCRIPT), str(config_path), str(inventory_path),
-         "--since", since_date],
+         "--since", since_date, "--skip-ids-file", skip_ids_path],
         cwd=str(PRESALES_DIR),
         capture_output=True,
         text=True,
         env=env,
     )
+
+    # Clean up the skip-IDs temp file
+    try:
+        Path(skip_ids_path).unlink(missing_ok=True)
+    except Exception:
+        pass
 
     after = list(PRESALES_DIR.glob(RECOMMENDATIONS_GLOB))
     new_files = [p for p in after if p.name not in before]
