@@ -883,18 +883,33 @@ def write_multisheet_excel(path: str, sheets: Dict[str, pd.DataFrame]) -> None:
             df.to_excel(writer, sheet_name=safe_name, index=False)
 
 
-def main() -> None:
-    if len(sys.argv) < 3:
-        print(
-            "Usage: python3 monday_presales_pipeline.py <monday_config.json> <inventory_path>\n"
-            "Env vars required:\n"
-            "  MONDAY_API_KEY\n"
-            "  OPENAI_API_KEY\n"
-        )
-        raise SystemExit(1)
+FIRST_RUN_SINCE = "2026-03-20"  # Hard floor: never process campaigns created before this date
 
-    config_path = sys.argv[1]
-    inventory_path = sys.argv[2]
+
+def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("config", help="Path to monday_config.json")
+    parser.add_argument("inventory", help="Path to inventory file")
+    parser.add_argument(
+        "--since",
+        default=None,
+        help="Only include campaigns created on/after this date (YYYY-MM-DD). "
+             f"Defaults to last successful run date, or {FIRST_RUN_SINCE} on first run.",
+    )
+    args = parser.parse_args()
+
+    config_path = args.config
+    inventory_path = args.inventory
+    since_date_str: str = args.since if args.since else FIRST_RUN_SINCE
+
+    try:
+        since_dt = datetime.strptime(since_date_str, "%Y-%m-%d")
+    except ValueError:
+        print(f"Invalid --since date '{since_date_str}', falling back to {FIRST_RUN_SINCE}")
+        since_dt = datetime.strptime(FIRST_RUN_SINCE, "%Y-%m-%d")
+
+    print(f"Processing campaigns created on/after: {since_dt.date()}")
 
     monday_key = os.getenv("MONDAY_API_KEY")
     if not monday_key:
@@ -919,6 +934,25 @@ def main() -> None:
         print(f"Fetching Monday board: {b.region}")
         items = fetch_board_items(monday_key, b.board_id)
         df = board_items_to_presales_df(items, b)
+
+        # Filter by since_date using the Monday_Submitted_At (created_at) column
+        if "Monday_Submitted_At" in df.columns and not df.empty:
+            def _parse_created(v: Any) -> Optional[datetime]:
+                try:
+                    s = str(v or "").strip()
+                    if not s:
+                        return None
+                    return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+                except Exception:
+                    return None
+
+            created_dts = df["Monday_Submitted_At"].apply(_parse_created)
+            mask = created_dts.apply(lambda d: d is None or d >= since_dt)
+            before_count = len(df)
+            df = df[mask].reset_index(drop=True)
+            skipped = before_count - len(df)
+            if skipped:
+                print(f"  Skipped {skipped} campaign(s) created before {since_dt.date()}")
         cleaned_sheets[b.region] = df
 
         print(f"Running recommendations for: {b.region} (rows={len(df)})")

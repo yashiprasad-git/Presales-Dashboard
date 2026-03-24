@@ -363,6 +363,23 @@ def insert_alerts(conn, rows: List[Dict[str, Any]]) -> int:
 # Pipeline runner
 # ---------------------------------------------------------------------------
 
+FIRST_RUN_SINCE = "2026-03-20"  # Hard floor — never process campaigns created before this date
+
+
+def _last_successful_run_date(conn) -> Optional[str]:
+    """Return the started_at_utc of the last successful pipeline run, or None."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT started_at_utc FROM pipeline_runs WHERE status = 'success' "
+            "ORDER BY started_at_utc DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+    if row and row[0]:
+        # Return just the date portion (YYYY-MM-DD)
+        return str(row[0])[:10]
+    return None
+
+
 def run_pipeline_and_ingest(config_path: Path, inventory_path: Path) -> Tuple[str, str]:
     if not PIPELINE_SCRIPT.exists():
         raise RuntimeError(f"Missing pipeline script: {PIPELINE_SCRIPT}")
@@ -379,6 +396,10 @@ def run_pipeline_and_ingest(config_path: Path, inventory_path: Path) -> Tuple[st
 
     conn = get_db()
     init_db(conn)
+
+    # Determine the since-date: last successful run date, or FIRST_RUN_SINCE on first run
+    since_date = _last_successful_run_date(conn) or FIRST_RUN_SINCE
+
     insert_run(conn, run_id, started_at)
 
     before = set(p.name for p in PRESALES_DIR.glob(RECOMMENDATIONS_GLOB))
@@ -388,7 +409,8 @@ def run_pipeline_and_ingest(config_path: Path, inventory_path: Path) -> Tuple[st
     env["OPENAI_API_KEY"] = openai_key
 
     proc = subprocess.run(
-        [sys.executable, str(PIPELINE_SCRIPT), str(config_path), str(inventory_path)],
+        [sys.executable, str(PIPELINE_SCRIPT), str(config_path), str(inventory_path),
+         "--since", since_date],
         cwd=str(PRESALES_DIR),
         capture_output=True,
         text=True,
@@ -647,7 +669,15 @@ def main() -> None:
 
     if run_clicked:
         try:
-            with st.spinner("Running pipeline… this can take a few minutes."):
+            # Preview which since-date will be used, before spinning
+            _prev_conn = get_db()
+            init_db(_prev_conn)
+            _since_preview = _last_successful_run_date(_prev_conn) or FIRST_RUN_SINCE
+            _prev_conn.close()
+            with st.spinner(
+                f"Running pipeline… picking up 'Done' campaigns created on/after **{_since_preview}**. "
+                "This can take a few minutes."
+            ):
                 run_id, _ = run_pipeline_and_ingest(Path(config_path), Path(inventory_path))
             st.success(f"Pipeline run completed. Run ID: {run_id}")
             st.rerun()
