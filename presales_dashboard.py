@@ -406,22 +406,21 @@ def run_pipeline_and_ingest(config_path: Path, inventory_path: Path) -> Tuple[st
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     started_at = utc_now_iso()
 
+    # ── Pre-run DB work (quick queries — close connection before the long subprocess) ──
     conn = get_db()
     init_db(conn)
-
-    # Determine the since-date: last successful run date, or FIRST_RUN_SINCE on first run
     since_date = _last_successful_run_date(conn) or FIRST_RUN_SINCE
+    skip_ids = _processed_item_ids(conn)
+    insert_run(conn, run_id, started_at)
+    conn.close()   # <-- close NOW so Supabase doesn't time out during the pipeline run
 
     # Write already-processed item IDs to a temp file so the pipeline can skip them
-    skip_ids = _processed_item_ids(conn)
     skip_ids_file = tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False, dir=str(PRESALES_DIR)
     )
     json.dump(skip_ids, skip_ids_file)
     skip_ids_file.close()
     skip_ids_path = skip_ids_file.name
-
-    insert_run(conn, run_id, started_at)
 
     before = set(p.name for p in PRESALES_DIR.glob(RECOMMENDATIONS_GLOB))
 
@@ -450,6 +449,9 @@ def run_pipeline_and_ingest(config_path: Path, inventory_path: Path) -> Tuple[st
 
     finished_at = utc_now_iso()
     status = "success" if proc.returncode == 0 else "failed"
+
+    # ── Post-run DB work — fresh connection after subprocess completes ──────
+    conn = get_db()
     finalize_run(conn, run_id, finished_at, status, proc.stdout or "", proc.stderr or "",
                  str(rec_file) if rec_file else None)
 
@@ -696,7 +698,7 @@ def main() -> None:
 
     if run_clicked:
         try:
-            # Preview which since-date will be used, before spinning
+            # Preview the since-date before spinning — use a short-lived connection
             _prev_conn = get_db()
             init_db(_prev_conn)
             _since_preview = _last_successful_run_date(_prev_conn) or FIRST_RUN_SINCE
