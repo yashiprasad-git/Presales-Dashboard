@@ -145,6 +145,8 @@ def init_schema(conn) -> None:
               p1_channel_count         INTEGER,
               p2_channel_count         INTEGER,
               p3_channel_count         INTEGER,
+              context_status           TEXT,
+              recommendation_basis     TEXT,
               error_log                TEXT,
               inserted_at_utc          TEXT NOT NULL,
               updated_at_utc           TEXT
@@ -222,6 +224,9 @@ def init_schema(conn) -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_campaigns_item ON campaigns(monday_item_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_alerts_open    ON alerts(resolved_at_utc, region);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_blocked_open   ON access_blocked(resolved_at_utc, region);")
+        # Migrations: add columns introduced after initial schema
+        cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS context_status TEXT;")
+        cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS recommendation_basis TEXT;")
     conn.commit()
 
 
@@ -340,30 +345,35 @@ def load_config(config_path: str) -> List[Dict]:
     boards = []
     for b in raw.get("boards", []):
         col_map = b.get("column_id_map", {})
-        product_col_ids: List[str] = []
-        raw_ids = col_map.get("__product_col_ids", "")
-        if raw_ids:
-            try:
-                decoded = json.loads(raw_ids)
-                if isinstance(decoded, list):
-                    product_col_ids = [str(x) for x in decoded if str(x).strip()]
-            except Exception:
-                pass
+
+        def _col(*keys: str) -> str:
+            """Return the first non-empty column ID found for any of the given keys."""
+            for k in keys:
+                v = col_map.get(k)
+                if v and str(v).strip():
+                    return str(v).strip()
+            return ""
+
+        # Build product column IDs from all product-related keys present in config
+        product_col_ids: List[str] = list(filter(None, [
+            _col("products_to_pitch", "product_to_propose"),  # primary product column
+            _col("product_proposed"),                          # secondary product column
+        ]))
 
         boards.append({
-            "region":           b["region"],
-            "board_id":         int(b["board_id"]),
-            "col_brand":        col_map.get("Brand Name") or col_map.get("brand_name", ""),
-            "col_vertical":     col_map.get("Vertical") or col_map.get("vertical", ""),
-            "col_country":      col_map.get("Country where campaign will run") or col_map.get("country", ""),
-            "col_run_dates":    col_map.get("Run dates") or col_map.get("run_dates", ""),
-            "col_rfp":          col_map.get("RFP Summary - outline objectives of campaign") or col_map.get("rfp_summary", ""),
-            "col_targeting":    col_map.get("Targeting - Summary of the type of content you want targeted for the campaign. Has the client indicated any specific targeting? Tentpoles? Sports?") or col_map.get("targeting", ""),
-            "col_trigger":      col_map.get("trigger list in local language (check if yes)") or col_map.get("trigger_list", ""),
-            "col_other":        col_map.get("Any other details") or col_map.get("any_other_details", ""),
-            "col_media_plan":   col_map.get("media_plan_col_id") or col_map.get("Media Plan", "text_mkqnx8ze"),
-            "product_col_ids":  product_col_ids,
-            "platform_col_id":  col_map.get("platform_col_id", ""),
+            "region":          b["region"],
+            "board_id":        int(b["board_id"]),
+            "col_brand":       _col("brand_name"),
+            "col_vertical":    _col("vertical"),
+            "col_country":     _col("country"),
+            "col_run_dates":   _col("run_dates"),
+            "col_rfp":         _col("rfp_summary"),
+            "col_targeting":   _col("targeting"),
+            "col_trigger":     _col("trigger_list"),
+            "col_other":       _col("any_other_details"),
+            "col_media_plan":  _col("media_plan") or "text_mkqnx8ze",
+            "product_col_ids": product_col_ids,
+            "platform_col_id": _col("platform_to_pitch"),  # APAC-specific
         })
     return boards
 
@@ -450,31 +460,57 @@ def read_public_sheet(url: str) -> Any:
     Download a Google Sheets / Drive-hosted Excel file (Anyone-with-link).
     Strategy 1: Sheets export URL (native .gsheet files).
     Strategy 2: Drive download URL (Excel .xlsx files in Drive — the .XLSX badge case).
+    Raises PermissionError with a specific human-readable reason on failure.
     """
     sheet_id = extract_sheet_id(url)
     if not sheet_id:
         raise ValueError(f"Not a valid Google Sheets / Drive URL: {url}")
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0"})
-    # Strategy 1
+
+    last_status = None
+    last_ct     = ""
+
+    # Strategy 1: native Sheets export
     try:
         resp = session.get(
             f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx",
             timeout=30,
         )
-        ct = resp.headers.get("content-type", "")
-        if resp.status_code == 200 and _is_binary_excel(ct, resp.content):
+        last_status = resp.status_code
+        last_ct     = resp.headers.get("content-type", "")
+        if last_status == 200 and _is_binary_excel(last_ct, resp.content):
             return pd.ExcelFile(io.BytesIO(resp.content))
     except Exception:
         pass
-    # Strategy 2
+
+    # Strategy 2: Drive direct download (for .xlsx files stored in Drive)
     content = _drive_download(session, sheet_id)
     if content:
         return pd.ExcelFile(io.BytesIO(content))
-    raise PermissionError(
-        f"Cannot access media plan (not public or login required): {url}\n"
-        "Fix: Share → 'Anyone with the link' → Viewer"
-    )
+
+    # Build a specific reason for the failure
+    if last_status == 401:
+        reason = (
+            "Sharing is 'Anyone in your organisation' — change to "
+            "'Anyone with the link → Viewer' (currently requires Google login)"
+        )
+    elif last_status == 403:
+        reason = (
+            "Permission denied (HTTP 403) — file may be restricted. "
+            "Share → 'Anyone with the link' → Viewer"
+        )
+    elif last_status and last_status != 200:
+        reason = f"HTTP {last_status} returned by Google — sheet may not be public"
+    elif "text/html" in last_ct:
+        reason = (
+            "Google returned a login page — sharing must be "
+            "'Anyone with the link → Viewer', not 'Anyone in organisation'"
+        )
+    else:
+        reason = "Could not download sheet — ensure it is shared as 'Anyone with the link → Viewer'"
+
+    raise PermissionError(reason)
 
 
 def find_context_tab(xls: Any) -> Optional[str]:
@@ -813,15 +849,25 @@ def _insert_campaign(conn, run_id: str, item_id: str, board_id: int,
     conn.commit()
 
 
+def _update_context_status(conn, item_id: str, status: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE campaigns
+            SET context_status=%s, updated_at_utc=%s
+            WHERE monday_item_id=%s
+        """, (status, utc_now_iso(), item_id))
+    conn.commit()
+
+
 def _update_campaign_analysis(conn, item_id: str, language: str, category: str,
-                               error: str = "") -> None:
+                               recommendation_basis: str = "", error: str = "") -> None:
     with conn.cursor() as cur:
         cur.execute("""
             UPDATE campaigns
             SET derived_language=%s, recommended_category=%s,
-                error_log=%s, updated_at_utc=%s
+                recommendation_basis=%s, error_log=%s, updated_at_utc=%s
             WHERE monday_item_id=%s
-        """, (language, category, error or None, utc_now_iso(), item_id))
+        """, (language, category, recommendation_basis or None, error or None, utc_now_iso(), item_id))
     conn.commit()
 
 
@@ -1003,9 +1049,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Unified Presales Pipeline")
     parser.add_argument("config",    help="Path to monday_config.json")
     parser.add_argument("inventory", help="Path to inventory file (xlsx or csv)")
-    parser.add_argument("--since",   default=None,
+    parser.add_argument("--since",    default=None,
                         help=f"Process campaigns created on/after YYYY-MM-DD "
                              f"(default: last successful run or {FIRST_RUN_SINCE})")
+    parser.add_argument("--max-step", type=int, default=4, choices=[1, 2, 3, 4],
+                        help="Stop after this step (1=Monday fetch, 2=+Sheets, 3=+OpenAI, 4=+Inventory). Default: 4 (all steps)")
     args = parser.parse_args()
 
     monday_key = _get_env("MONDAY_API_KEY")
@@ -1095,6 +1143,13 @@ def main() -> None:
             monday_url    = MONDAY_ITEM_URL.format(board_id=board_id, item_id=item_id)
             product_parts = [str(col_values.get(cid, "") or "") for cid in board["product_col_ids"]]
 
+            # For APAC, also include Platform to pitch so the stored value reflects
+            # the full combination used for filtering (e.g. "Mirrors 2.0 | YouTube")
+            if "APAC" in region.upper():
+                platform_val = str(col_values.get(board.get("platform_col_id", ""), "") or "").strip()
+                if platform_val and platform_val not in product_parts:
+                    product_parts.append(platform_val)
+
             data = {
                 "monday_url":        monday_url,
                 "campaign_name":     item.get("name", ""),
@@ -1147,7 +1202,6 @@ def main() -> None:
         board    = board_map.get(str(board_id), {})
 
         # Re-fetch media plan URL from Monday for this item (it's not stored in campaigns table)
-        # We need to do a targeted fetch for just this item
         try:
             media_url_data = _monday_post(monday_key, """
                 query ($ids: [ID!]!) {
@@ -1163,6 +1217,7 @@ def main() -> None:
             media_plan_url = ""
 
         if not media_plan_url:
+            _update_context_status(conn, item_id, "❌ Media plan link not set on Monday.com")
             ctx_no_link += 1
             continue
 
@@ -1174,39 +1229,58 @@ def main() -> None:
         try:
             xls = read_public_sheet(media_plan_url)
         except PermissionError as e:
-            print(f"   BLOCKED: {e}")
-            _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta, str(e))
+            reason = str(e)
+            print(f"   BLOCKED: {reason}")
+            _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta, reason)
+            _update_context_status(conn, item_id, f"❌ Access blocked – fix: Share → Anyone with the link → Viewer")
             ctx_blocked += 1
             continue
         except Exception as e:
-            print(f"   FAILED: {e}")
-            _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta, str(e))
+            reason = str(e)
+            print(f"   FAILED: {reason}")
+            _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta, reason)
+            _update_context_status(conn, item_id, f"❌ Could not read media plan – {reason}")
             ctx_blocked += 1
             continue
 
         tab = find_context_tab(xls)
         if not tab:
             _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta, "No 'context' tab found")
+            _update_context_status(conn, item_id, "❌ No 'Context' tab found in media plan")
             ctx_blocked += 1
             continue
 
         try:
             ctx_rows, local_lang = read_context_rows(xls, tab)
         except Exception as e:
-            _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta, f"Context parse error: {e}")
+            reason = f"Context parse error: {e}"
+            _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta, reason)
+            _update_context_status(conn, item_id, f"❌ {reason}")
             ctx_blocked += 1
             continue
 
         if ctx_rows:
             _insert_context_rows(conn, run_id, item_id, int(board_id or 0), meta, ctx_rows, local_lang)
-            print(f"   ✓ {len(ctx_rows)} context rows saved | lang: {local_lang or 'English'}")
+            lang_label = local_lang or "English"
+            print(f"   ✓ {len(ctx_rows)} context rows saved | lang: {lang_label}")
+            _update_context_status(conn, item_id, f"✅ {len(ctx_rows)} rows saved ({lang_label})")
             ctx_processed += 1
         else:
             _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta, "Context tab is empty")
+            _update_context_status(conn, item_id, "❌ Context tab found but Tactic/Sub-Tactic/Signal columns are empty")
             ctx_blocked += 1
 
     print(f"\n   ✓ Step 2 complete — Processed: {ctx_processed} | "
           f"Blocked: {ctx_blocked} | No link: {ctx_no_link}")
+
+    if args.max_step < 3:
+        _log_run_finish(conn, run_id, "success")
+        conn.close()
+        print(f"\n{'='*60}")
+        print(f"✅ Pipeline stopped after Step 2 (--max-step {args.max_step})")
+        print(f"   Verify data in Supabase, then re-run without --max-step to complete.")
+        print(f"{'='*60}\n")
+        return
 
     # ────────────────────────────────────────────────────────────────────────
     # STEP 3 — OpenAI → update campaigns (language + category)
@@ -1232,6 +1306,7 @@ def main() -> None:
         language  = ", ".join(lang_list)
 
         context_tactics = _get_context_tactics(conn, item_id)
+        basis = "Input + Context List" if context_tactics else "Input only"
 
         try:
             category = derive_categories_with_openai(
@@ -1239,13 +1314,22 @@ def main() -> None:
                 brand=camp.get("brand_name"), vertical=camp.get("vertical"),
                 category_list=category_list, context_tactics=context_tactics,
             )
-            _update_campaign_analysis(conn, item_id, language, category)
-            print(f"   ✓ Language: {language} | Category: {category}")
+            _update_campaign_analysis(conn, item_id, language, category, basis)
+            print(f"   ✓ Language: {language} | Category: {category} | Basis: {basis}")
         except Exception as e:
-            _update_campaign_analysis(conn, item_id, language, f"ERROR: {e}", str(e))
+            _update_campaign_analysis(conn, item_id, language, f"ERROR: {e}", basis, str(e))
             print(f"   ERROR: {e}")
 
     print(f"\n   ✓ Step 3 complete")
+
+    if args.max_step < 4:
+        _log_run_finish(conn, run_id, "success")
+        conn.close()
+        print(f"\n{'='*60}")
+        print(f"✅ Pipeline stopped after Step 3 (--max-step {args.max_step})")
+        print(f"   Verify language/category in Supabase, then re-run without --max-step.")
+        print(f"{'='*60}\n")
+        return
 
     # ────────────────────────────────────────────────────────────────────────
     # STEP 4 — Inventory check → update campaigns + alerts

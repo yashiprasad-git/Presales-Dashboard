@@ -151,10 +151,10 @@ def fetch_campaigns(conn, days: Optional[int] = 30, older: bool = False) -> pd.D
 
     return _df(conn, f"""
         SELECT region, campaign_name, brand_name, vertical, country, run_dates,
-               derived_language, recommended_category,
+               derived_language, recommended_category, recommendation_basis,
                inventory_status, available_inventory_count,
                p1_channel_count, p2_channel_count, p3_channel_count,
-               error_log, monday_url, inserted_at_utc
+               context_status, error_log, monday_url, inserted_at_utc
         FROM campaigns
         {clause}
         ORDER BY inserted_at_utc DESC
@@ -395,9 +395,11 @@ def main() -> None:
                 filt30 = filt30[hay.str.contains(srch, na=False)]
 
             st.write(f"Rows shown: **{len(filt30)}** / Total: **{len(df_30)}**")
-            col_cfg30 = {}
-            if "monday_url" in filt30.columns:
-                col_cfg30["monday_url"] = st.column_config.LinkColumn("Monday Link", display_text="Open")
+            col_cfg30 = {
+                "monday_url":            st.column_config.LinkColumn("Monday Link", display_text="Open"),
+                "recommendation_basis":  st.column_config.TextColumn("Recommendation Basis"),
+                "context_status":        st.column_config.TextColumn("Context Status"),
+            }
             st.dataframe(filt30, use_container_width=True, height=600, column_config=col_cfg30)
 
     # ── Older Campaigns ───────────────────────────────────────────────────
@@ -407,9 +409,11 @@ def main() -> None:
             st.info("No campaigns older than 30 days.")
         else:
             st.write(f"Older campaigns: **{len(df_old)}**")
-            old_cfg = {}
-            if "monday_url" in df_old.columns:
-                old_cfg["monday_url"] = st.column_config.LinkColumn("Monday Link", display_text="Open")
+            old_cfg = {
+                "monday_url":            st.column_config.LinkColumn("Monday Link", display_text="Open"),
+                "recommendation_basis":  st.column_config.TextColumn("Recommendation Basis"),
+                "context_status":        st.column_config.TextColumn("Context Status"),
+            }
             st.dataframe(df_old, use_container_width=True, height=600, column_config=old_cfg)
 
     # ── Access Blocked ────────────────────────────────────────────────────
