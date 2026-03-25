@@ -330,38 +330,94 @@ def should_include_campaign(col_values: Dict[str, str], board: Dict[str, Any]) -
 # ---------------------------------------------------------------------------
 
 def extract_sheet_id(url: str) -> Optional[str]:
-    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url or "")
+    # Handle both Google Sheets URLs and Drive file URLs
+    m = re.search(r"/(?:spreadsheets|file)/d/([a-zA-Z0-9_-]+)", url or "")
     return m.group(1) if m else None
+
+
+def _is_binary_excel(content_type: str, content: bytes) -> bool:
+    """Return True if the response looks like a real Excel/binary file, not an HTML page."""
+    if "text/html" in content_type:
+        return False
+    # Double-check first bytes: XLSX files start with PK (zip magic 0x504B)
+    return len(content) > 4 and content[:2] == b"PK"
+
+
+def _drive_download(session: "requests.Session", file_id: str) -> Optional[bytes]:
+    """
+    Download a file from Google Drive for 'Anyone with the link' files.
+    Handles both direct downloads and Google's virus-scan confirmation page
+    (shown for larger files).
+    """
+    url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    resp = session.get(url, timeout=60)
+    ct = resp.headers.get("content-type", "")
+
+    if resp.status_code == 200 and _is_binary_excel(ct, resp.content):
+        return resp.content
+
+    # Google shows an HTML confirmation page for larger files — extract the token
+    if resp.status_code == 200 and "text/html" in ct:
+        # Try the newer `uuid` confirm pattern first, then the classic `confirm=T` pattern
+        m = re.search(r'confirm=([0-9A-Za-z_-]+)&', resp.text) or \
+            re.search(r'confirm=([0-9A-Za-z_-]+)"', resp.text) or \
+            re.search(r'"downloadUrl":"([^"]+)"', resp.text)
+        if m:
+            token_or_url = m.group(1)
+            if token_or_url.startswith("http"):
+                confirm_url = token_or_url
+            else:
+                confirm_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm={token_or_url}"
+            resp2 = session.get(confirm_url, timeout=90)
+            ct2 = resp2.headers.get("content-type", "")
+            if resp2.status_code == 200 and _is_binary_excel(ct2, resp2.content):
+                return resp2.content
+
+    return None
 
 
 def read_public_sheet(url: str) -> Any:
     """
-    Download a Google Sheet as an Excel workbook using the public export URL.
-    Works for sheets shared as 'Anyone with the link can view'.
-    Raises PermissionError for restricted sheets.
-    Raises ValueError if the URL is not a valid Google Sheets URL.
+    Download a Google Sheets / Drive-hosted Excel file for public
+    'Anyone with the link can view' files.
+
+    Mirrors the Apps Script logic: tries the native Google Sheets export URL
+    first (works for native .gsheet files), then falls back to the Google Drive
+    direct-download URL (needed for .xlsx files uploaded to Drive and opened in
+    Sheets view — they show the .XLSX badge in the browser).
+
+    Raises PermissionError if neither method succeeds (file is not public).
+    Raises ValueError for unrecognisable URLs.
     """
     sheet_id = extract_sheet_id(url)
     if not sheet_id:
-        raise ValueError(f"Not a valid Google Sheets URL: {url}")
+        raise ValueError(f"Not a valid Google Sheets / Drive URL: {url}")
 
-    export_url = (
-        f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+    # ── Strategy 1: Google Sheets export URL (native .gsheet files) ──────────
+    export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+    try:
+        resp = session.get(export_url, timeout=30)
+        ct = resp.headers.get("content-type", "")
+        if resp.status_code == 200 and _is_binary_excel(ct, resp.content):
+            return pd.ExcelFile(io.BytesIO(resp.content))
+    except Exception:
+        pass
+
+    # ── Strategy 2: Google Drive download (Excel .xlsx files in Drive) ───────
+    # This is the Python equivalent of the Apps Script's Drive.Files.copy()
+    # conversion: instead of converting, we download the raw Excel bytes directly.
+    content = _drive_download(session, sheet_id)
+    if content:
+        return pd.ExcelFile(io.BytesIO(content))
+
+    # Both methods returned HTML — file requires login or is not shared publicly
+    raise PermissionError(
+        f"Cannot access media plan (not public or login required): {url}\n"
+        f"Fix: open the Google Sheet/Drive file → Share → 'Anyone with the link' → Viewer"
     )
-    resp = requests.get(export_url, allow_redirects=False, timeout=30)
-
-    # Google redirects to the login page for restricted sheets
-    if resp.status_code in (301, 302):
-        raise PermissionError(f"Sheet requires login (access restricted): {url}")
-    if resp.status_code in (401, 403):
-        raise PermissionError(f"Access denied (HTTP {resp.status_code}): {url}")
-    resp.raise_for_status()
-
-    content_type = resp.headers.get("content-type", "")
-    if "text/html" in content_type:
-        raise PermissionError(f"Sheet returned a login page (access restricted): {url}")
-
-    return pd.ExcelFile(io.BytesIO(resp.content))
 
 
 def find_context_tab(xls: Any) -> Optional[str]:
