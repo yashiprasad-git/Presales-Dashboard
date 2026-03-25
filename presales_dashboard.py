@@ -42,11 +42,29 @@ def _get_database_url() -> str:
 
 
 def get_db():
+    """Open a fresh short-lived connection. Use for pipeline runs and mutations."""
     if psycopg2 is None:
         raise RuntimeError("psycopg2 is not installed. Run: pip install psycopg2-binary")
     url = _get_database_url()
     conn = psycopg2.connect(url)
     conn.autocommit = False
+    return conn
+
+
+@st.cache_resource(show_spinner=False)
+def _get_initialised_db():
+    """
+    Return a cached, already-initialised connection for read-only dashboard queries.
+    DB schema (CREATE TABLE / ALTER TABLE / CREATE INDEX) runs ONCE per server session,
+    not on every Streamlit rerun — this avoids Supabase statement timeouts on page load.
+    """
+    if psycopg2 is None:
+        raise RuntimeError("psycopg2 is not installed. Run: pip install psycopg2-binary")
+    url = _get_database_url()
+    conn = psycopg2.connect(url)
+    conn.autocommit = False
+    init_db(conn)
+    init_mdb_db(conn)
     return conn
 
 
@@ -408,7 +426,6 @@ def run_pipeline_and_ingest(config_path: Path, inventory_path: Path) -> Tuple[st
 
     # ── Pre-run DB work (quick queries — close connection before the long subprocess) ──
     conn = get_db()
-    init_db(conn)
     since_date = _last_successful_run_date(conn) or FIRST_RUN_SINCE
     skip_ids = _processed_item_ids(conn)
     insert_run(conn, run_id, started_at)
@@ -666,9 +683,8 @@ def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
 
-    conn = get_db()
-    init_db(conn)
-    init_mdb_db(conn)
+    # Cached connection — schema init runs only once per server session, not every rerun
+    conn = _get_initialised_db()
 
     if "resolve_alert_id" not in st.session_state:
         st.session_state["resolve_alert_id"] = None
@@ -698,11 +714,8 @@ def main() -> None:
 
     if run_clicked:
         try:
-            # Preview the since-date before spinning — use a short-lived connection
-            _prev_conn = get_db()
-            init_db(_prev_conn)
-            _since_preview = _last_successful_run_date(_prev_conn) or FIRST_RUN_SINCE
-            _prev_conn.close()
+            # Preview the since-date before spinning — reuse cached connection (read-only)
+            _since_preview = _last_successful_run_date(_get_initialised_db()) or FIRST_RUN_SINCE
             with st.spinner(
                 f"Running pipeline… picking up 'Done' campaigns created on/after **{_since_preview}**. "
                 "This can take a few minutes."
