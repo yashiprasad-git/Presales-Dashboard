@@ -54,14 +54,34 @@ FIRST_RUN_SINCE = "2026-03-20"
 PRODUCT_MATCH_KEYWORDS = ["mirror", "mirrors", "youtube"]
 
 TACTIC_KEYWORDS    = ["tactic", "tactique", "táctica", "tactiek", "taktik", "戦術"]
-SUBTACTIC_KEYWORDS = ["sub-tactic", "subtactic", "sub tactic", "sous-tactic",
-                      "sous tactique", "sub-táctica", "sub-taktik", "サブタクティック"]
-SIGNAL_KEYWORDS    = ["signal", "señal", "signaal", "संकेत", "シグナル"]
+SUBTACTIC_KEYWORDS = [
+    # English variants
+    "sub-tactic", "subtactic", "sub tactic", "subtact",
+    # French: "SOUS-TACTIQUES" — "sous-tact" is a prefix match
+    "sous-tact", "sous tact",
+    # Spanish / Dutch / German
+    "sub-táctica", "sub-taktik",
+    # Japanese
+    "サブタクティック",
+]
+SIGNAL_KEYWORDS    = [
+    "signal", "signals",
+    # French
+    "signaux",
+    # Spanish
+    "señal",
+    # Dutch
+    "signaal",
+    # Hindi
+    "संकेत",
+    # Japanese
+    "シグナル",
+]
 
 _TACTIC_LANG = {"tactique": "French", "táctica": "Spanish", "tactiek": "Dutch",
                 "taktik": "German", "戦術": "Japanese", "tactic": "English"}
-_SIGNAL_LANG = {"señal": "Spanish", "signaal": "Dutch", "संकेत": "Hindi",
-                "シグナル": "Japanese", "signal": "English"}
+_SIGNAL_LANG = {"signaux": "French", "señal": "Spanish", "signaal": "Dutch",
+                "संकेत": "Hindi", "シグナル": "Japanese", "signal": "English"}
 
 
 # ---------------------------------------------------------------------------
