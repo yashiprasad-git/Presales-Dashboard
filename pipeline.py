@@ -165,6 +165,7 @@ def init_schema(conn) -> None:
               p1_channel_count         INTEGER,
               p2_channel_count         INTEGER,
               p3_channel_count         INTEGER,
+              media_plan_url           TEXT,
               context_status           TEXT,
               recommendation_basis     TEXT,
               error_log                TEXT,
@@ -245,6 +246,7 @@ def init_schema(conn) -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_alerts_open    ON alerts(resolved_at_utc, region);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_blocked_open   ON access_blocked(resolved_at_utc, region);")
         # Migrations: add columns introduced after initial schema
+        cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS media_plan_url TEXT;")
         cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS context_status TEXT;")
         cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS recommendation_basis TEXT;")
     conn.commit()
@@ -854,8 +856,8 @@ def _insert_campaign(conn, run_id: str, item_id: str, board_id: int,
               run_id, monday_item_id, monday_board_id, monday_url, region,
               campaign_name, brand_name, vertical, country, run_dates,
               rfp_summary, targeting, trigger_list, any_other_details,
-              products_to_pitch, monday_submitted_at, inserted_at_utc
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+              products_to_pitch, monday_submitted_at, media_plan_url, inserted_at_utc
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (monday_item_id) DO NOTHING
         """, (
             run_id, item_id, str(board_id),
@@ -864,7 +866,8 @@ def _insert_campaign(conn, run_id: str, item_id: str, board_id: int,
             data.get("vertical"), data.get("country"), data.get("run_dates"),
             data.get("rfp_summary"), data.get("targeting"),
             data.get("trigger_list"), data.get("any_other_details"),
-            data.get("products_to_pitch"), data.get("monday_submitted_at"), now,
+            data.get("products_to_pitch"), data.get("monday_submitted_at"),
+            data.get("media_plan_url"), now,
         ))
     conn.commit()
 
@@ -1181,8 +1184,9 @@ def main() -> None:
                 "targeting":         col_values.get(board["col_targeting"], ""),
                 "trigger_list":      col_values.get(board["col_trigger"], ""),
                 "any_other_details": col_values.get(board["col_other"], ""),
-                "products_to_pitch": " | ".join(filter(None, product_parts)),
+                "products_to_pitch":   " | ".join(filter(None, product_parts)),
                 "monday_submitted_at": created_str,
+                "media_plan_url":      col_values.get(board["col_media_plan"], ""),
             }
 
             _insert_campaign(conn, run_id, item_id, board_id, region, data)
@@ -1199,42 +1203,25 @@ def main() -> None:
     # ────────────────────────────────────────────────────────────────────────
     print("\n── STEP 2: Reading media plans (Google Sheets)")
 
-    # Fetch all campaigns that don't yet have context rows or are in access_blocked
+    # Fetch campaigns that don't yet have context rows — media_plan_url already stored in DB
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("""
             SELECT c.monday_item_id, c.monday_board_id, c.monday_url, c.region,
                    c.campaign_name, c.brand_name, c.country, c.vertical,
-                   c.rfp_summary, c.targeting, c.any_other_details
+                   c.rfp_summary, c.targeting, c.any_other_details, c.media_plan_url
             FROM campaigns c
             WHERE NOT EXISTS (
                 SELECT 1 FROM context_rows cr WHERE cr.monday_item_id = c.monday_item_id
             )
+            AND c.context_status IS NULL
         """)
         campaigns_needing_context = [dict(r) for r in cur.fetchall()]
 
-    # Also get media plan URL for each (need board config)
-    board_map = {str(b["board_id"]): b for b in boards}
-
     ctx_processed = ctx_blocked = ctx_no_link = 0
     for camp in campaigns_needing_context:
-        item_id  = camp["monday_item_id"]
-        board_id = camp.get("monday_board_id", "")
-        board    = board_map.get(str(board_id), {})
-
-        # Re-fetch media plan URL from Monday for this item (it's not stored in campaigns table)
-        try:
-            media_url_data = _monday_post(monday_key, """
-                query ($ids: [ID!]!) {
-                  items(ids: $ids) {
-                    column_values { id text value type }
-                  }
-                }
-            """, {"ids": [item_id]})
-            col_vals = {cv["id"]: _format_col_value(cv)
-                        for cv in media_url_data["items"][0]["column_values"]}
-            media_plan_url = col_vals.get(board.get("col_media_plan", "text_mkqnx8ze"), "")
-        except Exception:
-            media_plan_url = ""
+        item_id        = camp["monday_item_id"]
+        board_id       = camp.get("monday_board_id", "")
+        media_plan_url = camp.get("media_plan_url") or ""
 
         if not media_plan_url:
             _update_context_status(conn, item_id, "❌ Media plan link not set on Monday.com")

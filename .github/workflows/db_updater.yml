@@ -1,0 +1,46 @@
+name: Daily DB Update
+
+on:
+  # Runs every day at 2:30 AM UTC = 8:00 AM IST (weekdays only)
+  schedule:
+    - cron: "30 2 * * 1-5"
+
+  # Also allows manual trigger from GitHub Actions tab
+  workflow_dispatch:
+    inputs:
+      since_date:
+        description: "Process campaigns since date (YYYY-MM-DD). Leave blank for auto."
+        required: false
+        default: ""
+
+jobs:
+  update-db:
+    name: Fetch Monday.com → PostgreSQL
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run DB Updater
+        env:
+          MONDAY_API_KEY: ${{ secrets.MONDAY_API_KEY }}
+          DATABASE_URL:   ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -n "${{ github.event.inputs.since_date }}" ]; then
+            python db_updater.py monday_config.json --since ${{ github.event.inputs.since_date }}
+          else
+            python db_updater.py monday_config.json
+          fi
+
+      # GitHub automatically emails you if this job fails (no extra setup needed)
+      # To enable: go to GitHub → Settings → Notifications → "Actions" → enable email
