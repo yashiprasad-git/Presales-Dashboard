@@ -162,7 +162,7 @@ def run_db_updater(since_date: Optional[str] = None) -> str:
 # ---------------------------------------------------------------------------
 
 def main():
-    st.title("🗄️ Presales DB Monitor")
+    st.title("🗄️ MDB Update Dashboard")
     st.caption("Monitors daily DB updates (Monday.com → PostgreSQL). "
                "Independent of the analysis dashboard.")
 
@@ -188,7 +188,7 @@ def main():
     # ── Tabs ────────────────────────────────────────────────────────────
     tab_runs, tab_ctx = st.tabs([
         "📋 Run History",
-        "🔍 Campaign Update Status",
+        "🔍 Campaign-wise Status",
     ])
 
     # ── Run History ─────────────────────────────────────────────────────
@@ -220,43 +220,58 @@ def main():
                                "Context Failed", "Context Pending"][:len(merged.columns)]
             st.dataframe(merged, use_container_width=True, hide_index=True)
 
-    # ── Campaign Update Status ───────────────────────────────────────────
+    # ── Campaign-wise Status ─────────────────────────────────────────────
     with tab_ctx:
-        st.subheader("Campaign Update Status")
+        st.subheader("Campaign-wise Status")
         df_ctx = fetch_context_status(conn)
         if df_ctx.empty:
             st.info("No campaigns yet.")
         else:
-            # Filters
-            regions  = ["All"] + sorted([r for r in df_ctx["region"].unique() if r])
-            statuses = ["All", "✅ Success", "❌ Failed / Blocked", "⏳ Pending"]
+            ctx_col = df_ctx["context_status"].fillna("")
+
+            # Build dynamic status options:
+            # Fixed buckets first, then every unique ❌ reason found in the data.
+            unique_failures = sorted(
+                ctx_col[ctx_col.str.startswith("❌")].unique().tolist()
+            )
+            status_options = (
+                ["All", "✅ Success", "❌ All Failed", "⏳ Not yet processed"]
+                + unique_failures
+            )
 
             f1, f2, f3 = st.columns([1, 1, 2])
-            reg  = f1.selectbox("Region", regions, key="ctx_reg")
-            stat = f2.selectbox("Status", statuses, key="ctx_stat")
+            reg  = f1.selectbox("Region",
+                                ["All"] + sorted([r for r in df_ctx["region"].unique() if r]),
+                                key="ctx_reg")
+            stat = f2.selectbox("Status", status_options, key="ctx_stat")
             srch = f3.text_input("Search campaign / brand", key="ctx_srch").strip().lower()
 
             filt = df_ctx.copy()
             if reg != "All":
                 filt = filt[filt["region"] == reg]
+
             if stat == "✅ Success":
-                filt = filt[filt["context_status"].str.startswith("✅", na=False)]
-            elif stat == "❌ Failed / Blocked":
-                filt = filt[filt["context_status"].str.startswith("❌", na=False)]
-            elif stat == "⏳ Pending":
-                filt = filt[filt["context_status"].isna() | (filt["context_status"] == "")]
+                filt = filt[ctx_col.reindex(filt.index).str.startswith("✅", na=False)]
+            elif stat == "❌ All Failed":
+                filt = filt[ctx_col.reindex(filt.index).str.startswith("❌", na=False)]
+            elif stat == "⏳ Not yet processed":
+                filt = filt[ctx_col.reindex(filt.index) == ""]
+            elif stat.startswith("❌"):
+                # Specific failure reason selected dynamically
+                filt = filt[ctx_col.reindex(filt.index) == stat]
+
             if srch:
                 hay = filt[["campaign_name", "brand_name"]].fillna("").astype(str)\
                           .agg(" ".join, axis=1).str.lower()
                 filt = filt[hay.str.contains(srch, na=False)]
 
             # Drop media_plan_url — Monday link is sufficient
-            display_cols = [c for c in filt.columns if c != "media_plan_url"]
-            filt = filt[display_cols]
+            filt = filt[[c for c in filt.columns if c != "media_plan_url"]]
 
             st.write(f"Showing **{len(filt)}** / {len(df_ctx)} campaigns")
 
-            if stat == "❌ Failed / Blocked" and len(filt) > 0:
+            if stat in ("❌ All Failed", "Access blocked") or \
+               (stat.startswith("❌") and "access blocked" in stat.lower() and len(filt) > 0):
                 st.caption("Fix blocked media plans: ask the file owner to set "
                            "**Share → Anyone with the link → Viewer** in Google Drive, "
                            "then re-run the DB updater.")
