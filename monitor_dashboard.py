@@ -84,17 +84,21 @@ def fetch_pipeline_runs(conn) -> pd.DataFrame:
 
 def fetch_run_summary(conn) -> pd.DataFrame:
     """Per-run campaign stats derived from campaigns table."""
-    return _df(conn, """
-        SELECT
-            run_id,
-            COUNT(*)                                                      AS total_campaigns,
-            SUM(CASE WHEN context_status LIKE '✅%' THEN 1 ELSE 0 END)   AS context_ok,
-            SUM(CASE WHEN context_status LIKE '❌%' THEN 1 ELSE 0 END)   AS context_failed,
-            SUM(CASE WHEN context_status IS NULL    THEN 1 ELSE 0 END)   AS context_pending
-        FROM campaigns
-        GROUP BY run_id
-        ORDER BY MIN(inserted_at_utc) DESC
-    """).fillna(0)
+    try:
+        return _df(conn, """
+            SELECT
+                run_id,
+                COUNT(*)                                                      AS total_campaigns,
+                SUM(CASE WHEN context_status LIKE '✅%%' THEN 1 ELSE 0 END)  AS context_ok,
+                SUM(CASE WHEN context_status LIKE '❌%%' THEN 1 ELSE 0 END)  AS context_failed,
+                SUM(CASE WHEN context_status IS NULL     THEN 1 ELSE 0 END)  AS context_pending
+            FROM campaigns
+            GROUP BY run_id
+            ORDER BY MIN(inserted_at_utc) DESC
+        """).fillna(0)
+    except Exception:
+        return pd.DataFrame(columns=["run_id", "total_campaigns",
+                                     "context_ok", "context_failed", "context_pending"])
 
 
 def fetch_campaign_summary(conn) -> pd.DataFrame:
@@ -198,18 +202,24 @@ def main():
         if df_runs.empty:
             st.info("No pipeline runs found. Click **▶ Run DB Update Now** to start.")
         else:
-            merged = df_runs.merge(df_summary, on="run_id", how="left").fillna(0)
+            if not df_summary.empty:
+                merged = df_runs.merge(df_summary, on="run_id", how="left").fillna(0)
+            else:
+                merged = df_runs.copy()
+                for col in ["total_campaigns", "context_ok", "context_failed", "context_pending"]:
+                    merged[col] = 0
 
             def _status_icon(s):
                 return "✅" if s == "success" else ("⏳" if s == "running" else "❌")
 
             merged[""] = merged["status"].apply(_status_icon)
-            merged = merged[["", "run_id", "started_at_utc", "finished_at_utc",
-                              "status", "total_campaigns", "context_ok",
-                              "context_failed", "context_pending"]]
+            display_cols = ["", "run_id", "started_at_utc", "finished_at_utc",
+                            "status", "total_campaigns", "context_ok",
+                            "context_failed", "context_pending"]
+            merged = merged[[c for c in display_cols if c in merged.columns]]
             merged.columns = ["", "Run ID", "Started (UTC)", "Finished (UTC)",
                                "Status", "Campaigns", "Context OK",
-                               "Context Failed", "Context Pending"]
+                               "Context Failed", "Context Pending"][:len(merged.columns)]
             st.dataframe(merged, use_container_width=True, hide_index=True)
 
     # ── Campaign Summary ─────────────────────────────────────────────────
