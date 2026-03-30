@@ -183,6 +183,27 @@ def main():
             st.rerun()
 
         st.divider()
+        st.subheader("🔄 Retry Blocked")
+        st.caption("Clears the status for access-blocked campaigns so the next "
+                   "DB update re-attempts their media plans.")
+        if st.button("🔄 Retry Blocked Campaigns", use_container_width=True):
+            try:
+                cur = conn.cursor()
+                cur.execute("""
+                    UPDATE campaigns
+                    SET context_status = NULL
+                    WHERE context_status ILIKE '%access blocked%'
+                """)
+                cleared = cur.rowcount
+                conn.commit()
+                if cleared:
+                    st.success(f"Cleared {cleared} campaign(s). Run DB Update Now to retry.")
+                else:
+                    st.info("No access-blocked campaigns found.")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+        st.divider()
         st.caption("Analysis dashboard → [Open](https://silverpush-presales-dashboard.streamlit.app)")
 
     # ── Tabs ────────────────────────────────────────────────────────────
