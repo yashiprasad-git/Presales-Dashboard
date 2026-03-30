@@ -1163,7 +1163,7 @@ def main() -> None:
         saved = skipped_date = skipped_done = skipped_product = 0
         for item in items:
             group = (item.get("group") or {}).get("title", "")
-            if group.lower() != "done":
+            if not group.lower().startswith("done"):
                 continue
 
             # Date filter
