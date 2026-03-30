@@ -232,10 +232,11 @@ def main():
             # Known failure patterns → short display labels shown in the filter.
             # Add new entries here whenever a new failure reason is introduced.
             KNOWN_FAILURE_LABELS = {
-                "media plan link not set": "Media plan missing",
-                "access blocked":          "Access blocked",
-                "context tab found but":   "Context tab empty",
-                "context tab not found":   "Context tab not found",
+                "media plan link not set": "❌ Media plan missing",
+                "access blocked":          "❌ Access blocked",
+                "context list not in standard format": "❌ Context list not in standard format",
+                "context tab found but":   "❌ Context list not in standard format",
+                "context tab not found":   "❌ Context tab not found",
             }
 
             def _short_label(raw: str) -> str:
@@ -294,7 +295,7 @@ def main():
 
             st.write(f"Showing **{len(filt)}** / {len(df_ctx)} campaigns")
 
-            if stat in ("Access blocked", "❌ All Failed") and len(filt) > 0:
+            if stat in ("❌ Access blocked", "❌ All Failed") and len(filt) > 0:
                 st.caption("Fix blocked media plans: ask the file owner to set "
                            "**Share → Anyone with the link → Viewer** in Google Drive, "
                            "then re-run the DB updater.")

@@ -1273,8 +1273,8 @@ def main() -> None:
             _update_context_status(conn, item_id, f"✅ {len(ctx_rows)} rows saved ({lang_label})")
             ctx_processed += 1
         else:
-            _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta, "Context tab is empty")
-            _update_context_status(conn, item_id, "❌ Context tab found but Tactic/Sub-Tactic/Signal columns are empty")
+            _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta, "Context list not in standard format")
+            _update_context_status(conn, item_id, "❌ Context list not in standard format")
             ctx_blocked += 1
 
     print(f"\n   ✓ Step 2 complete — Processed: {ctx_processed} | "

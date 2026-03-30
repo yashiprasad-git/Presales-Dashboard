@@ -262,9 +262,9 @@ def main() -> None:
             ctx_processed += 1
         else:
             _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta,
-                            "Context tab is empty")
+                            "Context list not in standard format")
             _update_context_status(conn, item_id,
-                "❌ Context tab found but Tactic/Sub-Tactic/Signal columns are empty")
+                "❌ Context list not in standard format")
             ctx_blocked += 1
 
     print(f"\n   ✓ Step 2 complete — Processed: {ctx_processed} | "
