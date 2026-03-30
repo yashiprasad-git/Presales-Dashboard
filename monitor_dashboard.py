@@ -190,7 +190,8 @@ def main():
         if st.button("🔄 Retry Now", use_container_width=True):
             with st.spinner("Re-attempting blocked/failed media plans…"):
                 try:
-                    summary = retry_blocked(conn)
+                    monday_key = os.getenv("MONDAY_API_KEY") or st.secrets.get("MONDAY_API_KEY", "")
+                    summary = retry_blocked(conn, monday_key=monday_key)
                     st.success("Done")
                     st.text_area("Result", summary, height=250)
                     st.rerun()

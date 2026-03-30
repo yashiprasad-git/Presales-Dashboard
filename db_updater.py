@@ -30,6 +30,7 @@ from pipeline import (
     _upsert_blocked,
     _already_complete,
     fetch_board_items,
+    fetch_item_media_url,
     find_context_tab,
     get_db,
     init_schema,
@@ -66,18 +67,22 @@ def _last_run_since(conn) -> str:
 # Retry blocked — re-attempt Step 2 for previously blocked campaigns
 # ---------------------------------------------------------------------------
 
-def retry_blocked(conn) -> str:
+def retry_blocked(conn, monday_key: str = "") -> str:
     """
-    Clear context_status for all blocked/failed campaigns (any ❌ status)
-    then immediately re-run Step 2 for them.
+    Re-attempt Step 2 for ALL ❌ campaigns (including 'media plan missing').
+    - If media_plan_url is NULL in DB, re-fetches it from Monday.com first.
+    - Clears old status, then immediately re-runs context extraction.
     Returns a human-readable summary string.
     """
     import psycopg2.extras
 
+    if not monday_key:
+        monday_key = _get_env("MONDAY_API_KEY") or ""
+
     run_id = datetime.datetime.now(timezone.utc).strftime("RETRY_%Y%m%d_%H%M%S")
     lines  = []
 
-    # Find all ❌ campaigns that have no context_rows yet
+    # Include ALL ❌ campaigns — even "media plan missing" ones
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("""
             SELECT monday_item_id, monday_board_id, monday_url, region,
@@ -97,7 +102,28 @@ def retry_blocked(conn) -> str:
 
     lines.append(f"Retrying {len(to_retry)} campaign(s)…\n")
 
-    # Clear their status so Step 2 logic can write fresh results
+    # Re-fetch media_plan_url from Monday for campaigns where it's NULL
+    if monday_key:
+        for camp in to_retry:
+            if not camp.get("media_plan_url"):
+                item_id = camp["monday_item_id"]
+                try:
+                    url = fetch_item_media_url(monday_key, item_id)
+                    if url:
+                        camp["media_plan_url"] = url
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE campaigns SET media_plan_url = %s WHERE monday_item_id = %s",
+                                (url, item_id),
+                            )
+                        conn.commit()
+                        lines.append(f"  🔗 {camp.get('campaign_name')} — fetched URL from Monday")
+                except Exception as e:
+                    lines.append(f"  ⚠️  {camp.get('campaign_name')} — could not fetch URL: {e}")
+    else:
+        lines.append("  ⚠️  No MONDAY_API_KEY — skipping URL re-fetch for missing links\n")
+
+    # Clear their status so fresh results can be written
     with conn.cursor() as cur:
         cur.execute("""
             UPDATE campaigns SET context_status = NULL

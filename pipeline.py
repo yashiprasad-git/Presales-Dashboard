@@ -271,6 +271,33 @@ def _monday_post(api_key: str, query: str, variables: Dict) -> Dict:
     return data.get("data", {})
 
 
+def fetch_item_media_url(api_key: str, item_id: str, col_id: str = "text_mkqnx8ze") -> str:
+    """Fetch the media plan URL for a single Monday.com item by column ID."""
+    query = """
+    query ($item_id: ID!, $col_id: String!) {
+      items(ids: [$item_id]) {
+        column_values(ids: [$col_id]) {
+          text
+        }
+      }
+    }
+    """
+    headers = {"Authorization": api_key, "Content-Type": "application/json"}
+    resp = requests.post(
+        MONDAY_API_URL,
+        json={"query": query, "variables": {"item_id": str(item_id), "col_id": col_id}},
+        headers=headers,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    items = (data.get("data") or {}).get("items") or []
+    if not items:
+        return ""
+    col_vals = items[0].get("column_values") or []
+    return (col_vals[0].get("text") or "").strip() if col_vals else ""
+
+
 def fetch_board_items(api_key: str, board_id: int, limit: int = 500) -> List[Dict]:
     """Fetch all items from a board using cursor pagination."""
     first_q = """
