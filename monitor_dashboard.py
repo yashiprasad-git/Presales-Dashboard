@@ -16,6 +16,7 @@ import pandas as pd
 import psycopg2
 import psycopg2.extras
 import streamlit as st
+from db_updater import retry_blocked
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -183,25 +184,18 @@ def main():
             st.rerun()
 
         st.divider()
-        st.subheader("🔄 Retry Blocked")
-        st.caption("Clears the status for access-blocked campaigns so the next "
-                   "DB update re-attempts their media plans.")
-        if st.button("🔄 Retry Blocked Campaigns", use_container_width=True):
-            try:
-                cur = conn.cursor()
-                cur.execute("""
-                    UPDATE campaigns
-                    SET context_status = NULL
-                    WHERE context_status ILIKE '%access blocked%'
-                """)
-                cleared = cur.rowcount
-                conn.commit()
-                if cleared:
-                    st.success(f"Cleared {cleared} campaign(s). Run DB Update Now to retry.")
-                else:
-                    st.info("No access-blocked campaigns found.")
-            except Exception as e:
-                st.error(f"Error: {e}")
+        st.subheader("🔄 Retry Failed Campaigns")
+        st.caption("Re-attempts media plan reading for all ❌ campaigns immediately — "
+                   "no second button click needed.")
+        if st.button("🔄 Retry Now", use_container_width=True):
+            with st.spinner("Re-attempting blocked/failed media plans…"):
+                try:
+                    summary = retry_blocked(conn)
+                    st.success("Done")
+                    st.text_area("Result", summary, height=250)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
         st.divider()
         st.caption("Analysis dashboard → [Open](https://silverpush-presales-dashboard.streamlit.app)")

@@ -63,6 +63,125 @@ def _last_run_since(conn) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Retry blocked — re-attempt Step 2 for previously blocked campaigns
+# ---------------------------------------------------------------------------
+
+def retry_blocked(conn) -> str:
+    """
+    Clear context_status for all blocked/failed campaigns (any ❌ status)
+    then immediately re-run Step 2 for them.
+    Returns a human-readable summary string.
+    """
+    import psycopg2.extras
+
+    run_id = datetime.datetime.now(timezone.utc).strftime("RETRY_%Y%m%d_%H%M%S")
+    lines  = []
+
+    # Find all ❌ campaigns that have no context_rows yet
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT monday_item_id, monday_board_id, monday_url, region,
+                   campaign_name, brand_name, country, vertical,
+                   rfp_summary, targeting, any_other_details, media_plan_url
+            FROM campaigns
+            WHERE context_status ILIKE '❌%'
+              AND NOT EXISTS (
+                  SELECT 1 FROM context_rows cr
+                  WHERE cr.monday_item_id = campaigns.monday_item_id
+              )
+        """)
+        to_retry = [dict(r) for r in cur.fetchall()]
+
+    if not to_retry:
+        return "No blocked/failed campaigns to retry."
+
+    lines.append(f"Retrying {len(to_retry)} campaign(s)…\n")
+
+    # Clear their status so Step 2 logic can write fresh results
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE campaigns SET context_status = NULL
+            WHERE context_status ILIKE '❌%'
+              AND NOT EXISTS (
+                  SELECT 1 FROM context_rows cr
+                  WHERE cr.monday_item_id = campaigns.monday_item_id
+              )
+        """)
+    conn.commit()
+
+    ctx_ok = ctx_fail = 0
+    for camp in to_retry:
+        item_id        = camp["monday_item_id"]
+        board_id       = camp.get("monday_board_id", "")
+        media_plan_url = camp.get("media_plan_url") or ""
+        name           = camp.get("campaign_name", item_id)
+
+        if not media_plan_url:
+            _update_context_status(conn, item_id, "❌ Media plan link not set on Monday.com")
+            lines.append(f"  ❌ {name} — no media plan URL")
+            ctx_fail += 1
+            continue
+
+        meta = {**camp, "brief": " | ".join(filter(None, [
+            camp.get("rfp_summary"), camp.get("targeting"),
+            camp.get("any_other_details"),
+        ])), "media_plan_url": media_plan_url}
+
+        try:
+            xls = read_public_sheet(media_plan_url)
+        except PermissionError as e:
+            reason = str(e)
+            _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta, reason)
+            _update_context_status(conn, item_id,
+                "❌ Access blocked – fix: Share → Anyone with the link → Viewer")
+            lines.append(f"  ❌ {name} — still access blocked")
+            ctx_fail += 1
+            continue
+        except Exception as e:
+            reason = str(e)
+            _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta, reason)
+            _update_context_status(conn, item_id, f"❌ Could not read media plan – {reason}")
+            lines.append(f"  ❌ {name} — {reason}")
+            ctx_fail += 1
+            continue
+
+        tab = find_context_tab(xls)
+        if not tab:
+            _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta, "No 'context' tab found")
+            _update_context_status(conn, item_id, "❌ No 'Context' tab found in media plan")
+            lines.append(f"  ❌ {name} — no Context tab")
+            ctx_fail += 1
+            continue
+
+        try:
+            ctx_rows, local_lang = read_context_rows(xls, tab)
+        except Exception as e:
+            reason = f"Context parse error: {e}"
+            _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta, reason)
+            _update_context_status(conn, item_id, f"❌ {reason}")
+            lines.append(f"  ❌ {name} — {reason}")
+            ctx_fail += 1
+            continue
+
+        if ctx_rows:
+            _insert_context_rows(conn, run_id, item_id, int(board_id or 0),
+                                  meta, ctx_rows, local_lang)
+            lang_label = local_lang or "English"
+            _update_context_status(conn, item_id, f"✅ {len(ctx_rows)} rows saved ({lang_label})")
+            lines.append(f"  ✅ {name} — {len(ctx_rows)} rows saved ({lang_label})")
+            ctx_ok += 1
+        else:
+            _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta,
+                            "Context list not in standard format")
+            _update_context_status(conn, item_id, "❌ Context list not in standard format")
+            lines.append(f"  ❌ {name} — context list not in standard format")
+            ctx_fail += 1
+
+    lines.append(f"\nDone — ✅ {ctx_ok} recovered  |  ❌ {ctx_fail} still failed")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -74,6 +193,8 @@ def main() -> None:
     parser.add_argument("--since", default=None,
                         help="Process campaigns created on/after YYYY-MM-DD "
                              f"(default: last successful run or {FIRST_RUN_SINCE})")
+    parser.add_argument("--retry-blocked", action="store_true",
+                        help="Re-attempt media plan reading for all blocked/failed campaigns")
     args = parser.parse_args()
 
     monday_key = _get_env("MONDAY_API_KEY")
@@ -82,6 +203,14 @@ def main() -> None:
 
     conn = get_db()
     init_schema(conn)
+
+    # Retry-blocked mode — re-attempt Step 2 only, then exit
+    if args.retry_blocked:
+        print("\nRetry-blocked mode: re-attempting all ❌ campaigns…")
+        summary = retry_blocked(conn)
+        print(summary)
+        conn.close()
+        return
 
     run_id     = datetime.datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     since_str  = args.since or _last_run_since(conn)
