@@ -186,11 +186,9 @@ def main():
         st.caption("Analysis dashboard → [Open](https://silverpush-presales-dashboard.streamlit.app)")
 
     # ── Tabs ────────────────────────────────────────────────────────────
-    tab_runs, tab_summary, tab_ctx, tab_blocked = st.tabs([
+    tab_runs, tab_ctx = st.tabs([
         "📋 Run History",
-        "📊 Campaign Summary",
-        "🔍 Context Status",
-        "🚫 Access Blocked",
+        "🔍 Campaign Update Status",
     ])
 
     # ── Run History ─────────────────────────────────────────────────────
@@ -222,82 +220,53 @@ def main():
                                "Context Failed", "Context Pending"][:len(merged.columns)]
             st.dataframe(merged, use_container_width=True, hide_index=True)
 
-    # ── Campaign Summary ─────────────────────────────────────────────────
-    with tab_summary:
-        st.subheader("Campaigns by Region")
-        df_camp = fetch_campaign_summary(conn)
-        if df_camp.empty:
-            st.info("No campaigns in DB yet.")
-        else:
-            total_row = pd.DataFrame([{
-                "region": "TOTAL",
-                "total": df_camp["total"].sum(),
-                "context_ok": df_camp["context_ok"].sum(),
-                "context_blocked": df_camp["context_blocked"].sum(),
-                "context_pending": df_camp["context_pending"].sum(),
-                "analysed": df_camp["analysed"].sum(),
-            }])
-            display = pd.concat([df_camp, total_row], ignore_index=True)
-            display.columns = ["Region", "Total", "Context ✅", "Context ❌",
-                                "Context ⏳", "Analysed"]
-            st.dataframe(display, use_container_width=True, hide_index=True)
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Total Campaigns", int(df_camp["total"].sum()))
-            c2.metric("Context Extracted", int(df_camp["context_ok"].sum()))
-            c3.metric("Access Blocked", int(df_camp["context_blocked"].sum()))
-            c4.metric("Analysed", int(df_camp["analysed"].sum()))
-
-    # ── Context Status ───────────────────────────────────────────────────
+    # ── Campaign Update Status ───────────────────────────────────────────
     with tab_ctx:
-        st.subheader("Context Extraction Status per Campaign")
+        st.subheader("Campaign Update Status")
         df_ctx = fetch_context_status(conn)
         if df_ctx.empty:
             st.info("No campaigns yet.")
         else:
-            regions = ["All"] + sorted([r for r in df_ctx["region"].unique() if r])
-            f1, f2 = st.columns([1, 3])
-            reg = f1.selectbox("Region", regions, key="ctx_reg")
-            srch = f2.text_input("Search campaign / brand", key="ctx_srch").strip().lower()
+            # Filters
+            regions  = ["All"] + sorted([r for r in df_ctx["region"].unique() if r])
+            statuses = ["All", "✅ Success", "❌ Failed / Blocked", "⏳ Pending"]
+
+            f1, f2, f3 = st.columns([1, 1, 2])
+            reg  = f1.selectbox("Region", regions, key="ctx_reg")
+            stat = f2.selectbox("Status", statuses, key="ctx_stat")
+            srch = f3.text_input("Search campaign / brand", key="ctx_srch").strip().lower()
 
             filt = df_ctx.copy()
             if reg != "All":
                 filt = filt[filt["region"] == reg]
+            if stat == "✅ Success":
+                filt = filt[filt["context_status"].str.startswith("✅", na=False)]
+            elif stat == "❌ Failed / Blocked":
+                filt = filt[filt["context_status"].str.startswith("❌", na=False)]
+            elif stat == "⏳ Pending":
+                filt = filt[filt["context_status"].isna() | (filt["context_status"] == "")]
             if srch:
                 hay = filt[["campaign_name", "brand_name"]].fillna("").astype(str)\
                           .agg(" ".join, axis=1).str.lower()
                 filt = filt[hay.str.contains(srch, na=False)]
 
+            # Drop media_plan_url — Monday link is sufficient
+            display_cols = [c for c in filt.columns if c != "media_plan_url"]
+            filt = filt[display_cols]
+
             st.write(f"Showing **{len(filt)}** / {len(df_ctx)} campaigns")
+
+            if stat == "❌ Failed / Blocked" and len(filt) > 0:
+                st.caption("Fix blocked media plans: ask the file owner to set "
+                           "**Share → Anyone with the link → Viewer** in Google Drive, "
+                           "then re-run the DB updater.")
+
             col_cfg = {}
             if "monday_url" in filt.columns:
                 col_cfg["monday_url"] = st.column_config.LinkColumn(
                     "Monday Link", display_text="Open")
-            if "media_plan_url" in filt.columns:
-                col_cfg["media_plan_url"] = st.column_config.LinkColumn(
-                    "Media Plan", display_text="Open")
             st.dataframe(filt, use_container_width=True, height=500,
                          column_config=col_cfg, hide_index=True)
-
-    # ── Access Blocked ────────────────────────────────────────────────────
-    with tab_blocked:
-        st.subheader("Media Plans — Access Blocked")
-        df_blk = fetch_blocked(conn)
-        if df_blk.empty:
-            st.success("No blocked media plans. All accessible.")
-        else:
-            st.warning(f"{len(df_blk)} media plan(s) could not be accessed.")
-            col_cfg_blk = {}
-            if "monday_url" in df_blk.columns:
-                col_cfg_blk["monday_url"] = st.column_config.LinkColumn(
-                    "Monday Link", display_text="Open")
-            if "media_plan_url" in df_blk.columns:
-                col_cfg_blk["media_plan_url"] = st.column_config.LinkColumn(
-                    "Media Plan", display_text="Open")
-            st.dataframe(df_blk, use_container_width=True, height=400,
-                         column_config=col_cfg_blk, hide_index=True)
-            st.caption("Fix: Ask the file owner to set **Share → Anyone with the link → Viewer** "
-                       "in Google Drive, then re-run the DB updater.")
 
     conn.close()
 
