@@ -229,14 +229,34 @@ def main():
         else:
             ctx_col = df_ctx["context_status"].fillna("")
 
-            # Build dynamic status options:
-            # Fixed buckets first, then every unique ❌ reason found in the data.
-            unique_failures = sorted(
-                ctx_col[ctx_col.str.startswith("❌")].unique().tolist()
-            )
+            # Known failure patterns → short display labels shown in the filter.
+            # Add new entries here whenever a new failure reason is introduced.
+            KNOWN_FAILURE_LABELS = {
+                "media plan link not set": "Media plan missing",
+                "access blocked":          "Access blocked",
+                "context tab found but":   "Context tab empty",
+                "context tab not found":   "Context tab not found",
+            }
+
+            def _short_label(raw: str) -> str:
+                """Return a short display name for a raw ❌ context_status value."""
+                lower = raw.lower()
+                for keyword, label in KNOWN_FAILURE_LABELS.items():
+                    if keyword in lower:
+                        return label
+                # Fallback: strip the leading ❌ and trim
+                return raw.lstrip("❌").strip()
+
+            # Map unique ❌ values → short labels (deduped by label)
+            seen_labels: dict[str, str] = {}   # label → raw value (first match wins)
+            for raw in sorted(ctx_col[ctx_col.str.startswith("❌")].unique()):
+                label = _short_label(raw)
+                if label not in seen_labels:
+                    seen_labels[label] = raw
+
             status_options = (
                 ["All", "✅ Success", "❌ All Failed", "⏳ Not yet processed"]
-                + unique_failures
+                + list(seen_labels.keys())
             )
 
             f1, f2, f3 = st.columns([1, 1, 2])
@@ -256,9 +276,13 @@ def main():
                 filt = filt[ctx_col.reindex(filt.index).str.startswith("❌", na=False)]
             elif stat == "⏳ Not yet processed":
                 filt = filt[ctx_col.reindex(filt.index) == ""]
-            elif stat.startswith("❌"):
-                # Specific failure reason selected dynamically
-                filt = filt[ctx_col.reindex(filt.index) == stat]
+            elif stat in seen_labels:
+                # Match all ❌ rows whose short label equals the selected option
+                matching_raws = [r for r, lbl in
+                                 {v: _short_label(v) for v in
+                                  ctx_col[ctx_col.str.startswith("❌")].unique()}.items()
+                                 if lbl == stat]
+                filt = filt[ctx_col.reindex(filt.index).isin(matching_raws)]
 
             if srch:
                 hay = filt[["campaign_name", "brand_name"]].fillna("").astype(str)\
@@ -270,8 +294,7 @@ def main():
 
             st.write(f"Showing **{len(filt)}** / {len(df_ctx)} campaigns")
 
-            if stat in ("❌ All Failed", "Access blocked") or \
-               (stat.startswith("❌") and "access blocked" in stat.lower() and len(filt) > 0):
+            if stat in ("Access blocked", "❌ All Failed") and len(filt) > 0:
                 st.caption("Fix blocked media plans: ask the file owner to set "
                            "**Share → Anyone with the link → Viewer** in Google Drive, "
                            "then re-run the DB updater.")
