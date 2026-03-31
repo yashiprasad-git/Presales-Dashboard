@@ -29,10 +29,9 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: pip install -r mdb/requirements.txt
+        run: pip install -r requirements.txt
 
       - name: Run DB Updater
-        working-directory: mdb
         env:
           MONDAY_API_KEY: ${{ secrets.MONDAY_API_KEY }}
           DATABASE_URL:   ${{ secrets.DATABASE_URL }}
