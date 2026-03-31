@@ -16,7 +16,6 @@ import pandas as pd
 import psycopg2
 import psycopg2.extras
 import streamlit as st
-from db_updater import retry_blocked
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -41,21 +40,7 @@ def _get_db_url() -> str:
     return url or ""
 
 
-@st.cache_resource(show_spinner=False)
-def _schema_initialized() -> bool:
-    """Run schema init once per server session."""
-    try:
-        from pipeline import get_db, init_schema
-        conn = get_db()
-        init_schema(conn)
-        conn.close()
-    except Exception:
-        pass
-    return True
-
-
 def get_conn():
-    _schema_initialized()
     return psycopg2.connect(_get_db_url())
 
 
@@ -190,6 +175,7 @@ def main():
         if st.button("🔄 Retry Now", use_container_width=True):
             with st.spinner("Re-attempting blocked/failed media plans…"):
                 try:
+                    from db_updater import retry_blocked  # lazy import — avoid slow startup
                     monday_key = os.getenv("MONDAY_API_KEY") or st.secrets.get("MONDAY_API_KEY", "")
                     summary = retry_blocked(conn, monday_key=monday_key)
                     st.success("Done")
