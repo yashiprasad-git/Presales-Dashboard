@@ -483,6 +483,127 @@ def _is_binary_excel(content_type: str, content: bytes) -> bool:
     return len(content) > 4 and content[:2] == b"PK"
 
 
+def _get_service_account_json_raw() -> str:
+    """JSON body for GOOGLE_SERVICE_ACCOUNT_JSON (env or secrets.toml)."""
+    v = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    if v.strip():
+        return v
+    sec = _load_secrets()
+    if isinstance(sec, dict):
+        raw = sec.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+        if isinstance(raw, str) and raw.strip():
+            return raw
+    return ""
+
+
+def _optional_google_credentials() -> Any:
+    """
+    Load service account credentials if configured, else None.
+    Configure either:
+      - GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json
+      - GOOGLE_SERVICE_ACCOUNT_JSON='{...}' (full JSON as string in env or secrets.toml)
+    Requires: pip install google-auth
+    """
+    try:
+        from google.auth.transport.requests import Request
+        from google.oauth2 import service_account
+    except ImportError:
+        path = _get_env("GOOGLE_APPLICATION_CREDENTIALS")
+        if path or _get_service_account_json_raw():
+            raise RuntimeError(
+                "google-auth is required for service account access. Run: pip install google-auth"
+            )
+        return None
+
+    scopes = (
+        "https://www.googleapis.com/auth/drive.readonly",
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+    )
+    json_raw = _get_service_account_json_raw()
+    path = _get_env("GOOGLE_APPLICATION_CREDENTIALS").strip()
+    if not path:
+        sec = _load_secrets()
+        if isinstance(sec, dict):
+            p = sec.get("GOOGLE_APPLICATION_CREDENTIALS")
+            if isinstance(p, str) and p.strip():
+                path = p.strip()
+
+    path_exp = os.path.expanduser(path) if path else ""
+
+    if json_raw:
+        try:
+            info = json.loads(json_raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON: {e}") from e
+        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+    elif path_exp and os.path.isfile(path_exp):
+        creds = service_account.Credentials.from_service_account_file(path_exp, scopes=scopes)
+    else:
+        return None
+
+    creds.refresh(Request())  # type: ignore[no-untyped-call]
+    return creds
+
+
+def _download_sheet_with_service_account(sheet_id: str, creds: Any) -> Optional[bytes]:
+    """Download spreadsheet as .xlsx bytes using OAuth Bearer (service account)."""
+    token = creds.token
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 1) Google Sheets host export (works for native Sheets)
+    r = requests.get(
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx",
+        headers=headers,
+        timeout=90,
+    )
+    ct = r.headers.get("content-type", "")
+    if r.status_code == 200 and _is_binary_excel(ct, r.content):
+        return r.content
+
+    # 2) Drive API export → xlsx (Google Sheets file in Drive)
+    r2 = requests.get(
+        f"https://www.googleapis.com/drive/v3/files/{sheet_id}/export",
+        params={
+            "mimeType": (
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ),
+        },
+        headers=headers,
+        timeout=90,
+    )
+    ct2 = r2.headers.get("content-type", "")
+    if r2.status_code == 200 and _is_binary_excel(ct2, r2.content):
+        return r2.content
+
+    # 3) Binary .xlsx uploaded to Drive (not a native Google Sheet)
+    r3 = requests.get(
+        f"https://www.googleapis.com/drive/v3/files/{sheet_id}",
+        params={"alt": "media"},
+        headers=headers,
+        timeout=90,
+    )
+    ct3 = r3.headers.get("content-type", "")
+    if r3.status_code == 200 and _is_binary_excel(ct3, r3.content):
+        return r3.content
+
+    # Helpful error text from API
+    detail = ""
+    for resp in (r, r2, r3):
+        if resp.content and len(resp.content) < 2000 and b"{" in resp.content[:100]:
+            try:
+                detail = resp.content.decode("utf-8", errors="replace")[:500]
+            except Exception:
+                pass
+            break
+    raise PermissionError(
+        f"Service account could not download file {sheet_id}. "
+        f"Share the file with the service account email (from the JSON: client_email), "
+        f"or enable domain-wide access. "
+        f"HTTP: export={r.status_code}, drive_export={r2.status_code}, media={r3.status_code}. "
+        f"{detail}"
+    )
+
+
 def _drive_download(session: Any, file_id: str) -> Optional[bytes]:
     url  = f"https://drive.google.com/uc?export=download&id={file_id}"
     resp = session.get(url, timeout=60)
@@ -506,21 +627,33 @@ def _drive_download(session: Any, file_id: str) -> Optional[bytes]:
 
 def read_public_sheet(url: str) -> Any:
     """
-    Download a Google Sheets / Drive-hosted Excel file (Anyone-with-link).
-    Strategy 1: Sheets export URL (native .gsheet files).
-    Strategy 2: Drive download URL (Excel .xlsx files in Drive — the .XLSX badge case).
-    Raises PermissionError with a specific human-readable reason on failure.
+    Download a Google Sheets / Drive-hosted Excel file.
+
+    If GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_SERVICE_ACCOUNT_JSON is set,
+    uses the service account first (for org-restricted or private files shared to SA).
+
+    Otherwise uses unauthenticated download (Anyone-with-the-link).
+
+    Strategy (public): Sheets export URL, then Drive uc?export download.
+    Strategy (service account): Bearer export, Drive export, Drive alt=media.
     """
     sheet_id = extract_sheet_id(url)
     if not sheet_id:
         raise ValueError(f"Not a valid Google Sheets / Drive URL: {url}")
+
+    # --- Service account path (optional) ---
+    creds = _optional_google_credentials()
+    if creds is not None:
+        content = _download_sheet_with_service_account(sheet_id, creds)
+        return pd.ExcelFile(io.BytesIO(content))
+
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0"})
 
     last_status = None
     last_ct     = ""
 
-    # Strategy 1: native Sheets export
+    # Strategy 1: native Sheets export (public)
     try:
         resp = session.get(
             f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx",
