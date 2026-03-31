@@ -476,12 +476,27 @@ def _get_service_account_json_raw() -> str:
     return ""
 
 
+def _get_impersonate_user() -> str:
+    """If set, domain-wide delegation: act as this user (e.g. program@silverpush.co)."""
+    v = _get_env("GOOGLE_IMPERSONATE_USER").strip()
+    if v:
+        return v
+    sec = _load_secrets()
+    if isinstance(sec, dict):
+        u = sec.get("GOOGLE_IMPERSONATE_USER")
+        if isinstance(u, str) and u.strip():
+            return u.strip()
+    return ""
+
+
 def _optional_google_credentials() -> Any:
     """
     Load service account credentials if configured, else None.
     Configure either:
       - GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json
       - GOOGLE_SERVICE_ACCOUNT_JSON='{...}' (full JSON as string in env or secrets.toml)
+    Optional (domain-wide delegation):
+      - GOOGLE_IMPERSONATE_USER=program@silverpush.co
     Requires: pip install google-auth
     """
     try:
@@ -520,6 +535,10 @@ def _optional_google_credentials() -> Any:
         creds = service_account.Credentials.from_service_account_file(path_exp, scopes=scopes)
     else:
         return None
+
+    impersonate = _get_impersonate_user()
+    if impersonate:
+        creds = creds.with_subject(impersonate)  # type: ignore[no-untyped-call]
 
     creds.refresh(Request())  # type: ignore[no-untyped-call]
     return creds
