@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-pipeline.py — Unified Presales Pipeline
-Replaces monday_presales_pipeline.py + mdb_pipeline.py.
+analysis/pipeline.py — Analysis-only pipeline (DB → OpenAI → inventory)
 
-Steps (Supabase is the single store throughout):
-  1. Monday.com  → campaigns table   (raw campaign data saved immediately)
-  2. Google Sheets → context_rows + access_blocked (media plan context)
-  3. OpenAI      → update campaigns  (derived language + recommended category)
-  4. Inventory   → update campaigns + alerts (inventory counts + status)
+This script MUST NOT ingest Monday.com data or write media-plan context rows.
+Those are handled by the MDB updater (Step 1 & 2) in the MDB project.
+
+This script does:
+  3) OpenAI: derive language + category using DB fields (+ optional context_rows)
+  4) Inventory: compute inventory status and raise alerts
 
 Usage:
-  python3 pipeline.py <monday_config.json> <inventory_path> [--since YYYY-MM-DD]
+  python3 pipeline.py <inventory_path>
 
 Secrets (env vars or .streamlit/secrets.toml):
-  MONDAY_API_KEY
   OPENAI_API_KEY
   DATABASE_URL
 """
@@ -46,8 +45,6 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-MONDAY_API_URL  = "https://api.monday.com/v2"
-MONDAY_ITEM_URL = "https://silverpush-global.monday.com/boards/{board_id}/pulses/{item_id}"
 PRESALES_DIR    = Path(__file__).resolve().parent
 FIRST_RUN_SINCE = "2026-03-20"
 
@@ -1096,20 +1093,11 @@ def _log_run_finish(conn, run_id: str, status: str) -> None:
 
 def main() -> None:
     import argparse
-    parser = argparse.ArgumentParser(description="Unified Presales Pipeline")
-    parser.add_argument("config",    help="Path to monday_config.json")
+    parser = argparse.ArgumentParser(description="Analysis-only pipeline (DB → OpenAI → inventory)")
     parser.add_argument("inventory", help="Path to inventory file (xlsx or csv)")
-    parser.add_argument("--since",    default=None,
-                        help=f"Process campaigns created on/after YYYY-MM-DD "
-                             f"(default: last successful run or {FIRST_RUN_SINCE})")
-    parser.add_argument("--max-step", type=int, default=4, choices=[1, 2, 3, 4],
-                        help="Stop after this step (1=Monday fetch, 2=+Sheets, 3=+OpenAI, 4=+Inventory). Default: 4 (all steps)")
     args = parser.parse_args()
 
-    monday_key = _get_env("MONDAY_API_KEY")
     openai_key = _get_env("OPENAI_API_KEY")
-    if not monday_key:
-        raise SystemExit("MONDAY_API_KEY is not set.")
     if not openai_key:
         raise SystemExit("OPENAI_API_KEY is not set.")
     if OpenAI is None:
@@ -1118,203 +1106,11 @@ def main() -> None:
     conn = get_db()
     init_schema(conn)
 
-    # Determine since-date
-    if args.since:
-        since_date = args.since
-    else:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT started_at_utc FROM pipeline_runs WHERE status='success' "
-                "ORDER BY started_at_utc DESC LIMIT 1"
-            )
-            row = cur.fetchone()
-        since_date = str(row[0])[:10] if row else FIRST_RUN_SINCE
-
-    try:
-        since_dt = datetime.strptime(since_date, "%Y-%m-%d")
-    except ValueError:
-        since_dt = datetime.strptime(FIRST_RUN_SINCE, "%Y-%m-%d")
-        since_date = FIRST_RUN_SINCE
-
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     _log_run_start(conn, run_id, utc_now_iso())
     print(f"\n{'='*60}")
-    print(f"Pipeline run: {run_id}  |  since: {since_date}")
+    print(f"Analysis run: {run_id}")
     print(f"{'='*60}")
-
-    boards = load_config(args.config)
-
-    # ────────────────────────────────────────────────────────────────────────
-    # STEP 1 — Monday.com → campaigns table
-    # ────────────────────────────────────────────────────────────────────────
-    print("\n── STEP 1: Fetching campaigns from Monday.com")
-    new_campaigns = 0
-    for board in boards:
-        region   = board["region"]
-        board_id = board["board_id"]
-        print(f"\n   Board: {region}")
-
-        try:
-            items = fetch_board_items(monday_key, board_id)
-        except Exception as e:
-            print(f"   ERROR: {e}")
-            continue
-
-        saved = skipped_date = skipped_done = skipped_product = 0
-        for item in items:
-            group = (item.get("group") or {}).get("title", "")
-            if not group.lower().startswith("done"):
-                continue
-
-            # Date filter
-            created_str = item.get("created_at") or ""
-            try:
-                created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00")).replace(tzinfo=None)
-                if created_dt < since_dt:
-                    skipped_date += 1
-                    continue
-            except Exception:
-                pass
-
-            item_id = str(item["id"])
-
-            # Already fully processed
-            if _already_complete(conn, item_id):
-                skipped_done += 1
-                continue
-
-            col_values = {cv["id"]: _format_col_value(cv) for cv in item.get("column_values", [])}
-
-            # Product filter
-            if not should_include(col_values, board):
-                skipped_product += 1
-                continue
-
-            monday_url    = MONDAY_ITEM_URL.format(board_id=board_id, item_id=item_id)
-            product_parts = [str(col_values.get(cid, "") or "") for cid in board["product_col_ids"]]
-
-            # For APAC, also include Platform to pitch so the stored value reflects
-            # the full combination used for filtering (e.g. "Mirrors 2.0 | YouTube")
-            if "APAC" in region.upper():
-                platform_val = str(col_values.get(board.get("platform_col_id", ""), "") or "").strip()
-                if platform_val and platform_val not in product_parts:
-                    product_parts.append(platform_val)
-
-            data = {
-                "monday_url":        monday_url,
-                "campaign_name":     item.get("name", ""),
-                "brand_name":        col_values.get(board["col_brand"], ""),
-                "vertical":          col_values.get(board["col_vertical"], ""),
-                "country":           col_values.get(board["col_country"], ""),
-                "run_dates":         col_values.get(board["col_run_dates"], ""),
-                "rfp_summary":       col_values.get(board["col_rfp"], ""),
-                "targeting":         col_values.get(board["col_targeting"], ""),
-                "trigger_list":      col_values.get(board["col_trigger"], ""),
-                "any_other_details": col_values.get(board["col_other"], ""),
-                "products_to_pitch":   " | ".join(filter(None, product_parts)),
-                "monday_submitted_at": created_str,
-                "media_plan_url":      col_values.get(board["col_media_plan"], ""),
-            }
-
-            _insert_campaign(conn, run_id, item_id, board_id, region, data)
-            saved += 1
-            new_campaigns += 1
-
-        print(f"   Saved: {saved} | Skipped (date): {skipped_date} | "
-              f"Skipped (done): {skipped_done} | Skipped (product): {skipped_product}")
-
-    print(f"\n   ✓ Step 1 complete — {new_campaigns} new campaign(s) saved to Supabase")
-
-    # ────────────────────────────────────────────────────────────────────────
-    # STEP 2 — Google Sheets → context_rows + access_blocked
-    # ────────────────────────────────────────────────────────────────────────
-    print("\n── STEP 2: Reading media plans (Google Sheets)")
-
-    # Fetch campaigns that don't yet have context rows — media_plan_url already stored in DB
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("""
-            SELECT c.monday_item_id, c.monday_board_id, c.monday_url, c.region,
-                   c.campaign_name, c.brand_name, c.country, c.vertical,
-                   c.rfp_summary, c.targeting, c.any_other_details, c.media_plan_url
-            FROM campaigns c
-            WHERE NOT EXISTS (
-                SELECT 1 FROM context_rows cr WHERE cr.monday_item_id = c.monday_item_id
-            )
-            AND c.context_status IS NULL
-        """)
-        campaigns_needing_context = [dict(r) for r in cur.fetchall()]
-
-    ctx_processed = ctx_blocked = ctx_no_link = 0
-    for camp in campaigns_needing_context:
-        item_id        = camp["monday_item_id"]
-        board_id       = camp.get("monday_board_id", "")
-        media_plan_url = camp.get("media_plan_url") or ""
-
-        if not media_plan_url:
-            _update_context_status(conn, item_id, "❌ Media plan link not set on Monday.com")
-            ctx_no_link += 1
-            continue
-
-        meta = {**camp, "brief": " | ".join(filter(None, [
-            camp.get("rfp_summary"), camp.get("targeting"), camp.get("any_other_details"),
-        ])), "media_plan_url": media_plan_url}
-
-        print(f"   Reading: {camp.get('campaign_name')} ({camp.get('region')})")
-        try:
-            xls = read_public_sheet(media_plan_url)
-        except PermissionError as e:
-            reason = str(e)
-            print(f"   BLOCKED: {reason}")
-            _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta, reason)
-            _update_context_status(conn, item_id, f"❌ Access blocked – fix: Share → Anyone with the link → Viewer")
-            ctx_blocked += 1
-            continue
-        except Exception as e:
-            reason = str(e)
-            print(f"   FAILED: {reason}")
-            _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta, reason)
-            _update_context_status(conn, item_id, f"❌ Could not read media plan – {reason}")
-            ctx_blocked += 1
-            continue
-
-        tab = find_context_tab(xls)
-        if not tab:
-            _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta, "No 'context' tab found")
-            _update_context_status(conn, item_id, "❌ No 'Context' tab found in media plan")
-            ctx_blocked += 1
-            continue
-
-        try:
-            ctx_rows, local_lang = read_context_rows(xls, tab)
-        except Exception as e:
-            reason = f"Context parse error: {e}"
-            _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta, reason)
-            _update_context_status(conn, item_id, f"❌ {reason}")
-            ctx_blocked += 1
-            continue
-
-        if ctx_rows:
-            _insert_context_rows(conn, run_id, item_id, int(board_id or 0), meta, ctx_rows, local_lang)
-            lang_label = local_lang or "English"
-            print(f"   ✓ {len(ctx_rows)} context rows saved | lang: {lang_label}")
-            _update_context_status(conn, item_id, f"✅ {len(ctx_rows)} rows saved ({lang_label})")
-            ctx_processed += 1
-        else:
-            _upsert_blocked(conn, run_id, item_id, int(board_id or 0), meta, "Context list not in standard format")
-            _update_context_status(conn, item_id, "❌ Context list not in standard format")
-            ctx_blocked += 1
-
-    print(f"\n   ✓ Step 2 complete — Processed: {ctx_processed} | "
-          f"Blocked: {ctx_blocked} | No link: {ctx_no_link}")
-
-    if args.max_step < 3:
-        _log_run_finish(conn, run_id, "success")
-        conn.close()
-        print(f"\n{'='*60}")
-        print(f"✅ Pipeline stopped after Step 2 (--max-step {args.max_step})")
-        print(f"   Verify data in Supabase, then re-run without --max-step to complete.")
-        print(f"{'='*60}\n")
-        return
 
     # ────────────────────────────────────────────────────────────────────────
     # STEP 3 — OpenAI → update campaigns (language + category)
@@ -1355,15 +1151,6 @@ def main() -> None:
             print(f"   ERROR: {e}")
 
     print(f"\n   ✓ Step 3 complete")
-
-    if args.max_step < 4:
-        _log_run_finish(conn, run_id, "success")
-        conn.close()
-        print(f"\n{'='*60}")
-        print(f"✅ Pipeline stopped after Step 3 (--max-step {args.max_step})")
-        print(f"   Verify language/category in Supabase, then re-run without --max-step.")
-        print(f"{'='*60}\n")
-        return
 
     # ────────────────────────────────────────────────────────────────────────
     # STEP 4 — Inventory check → update campaigns + alerts

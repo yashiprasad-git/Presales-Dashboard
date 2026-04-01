@@ -177,24 +177,19 @@ def fetch_access_blocked(conn) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def run_pipeline(config_path: Path, inventory_path: Path, since_date: str) -> str:
-    monday_key = os.getenv("MONDAY_API_KEY") or st.secrets.get("MONDAY_API_KEY", "")  # type: ignore[attr-defined]
     openai_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")  # type: ignore[attr-defined]
     db_url     = os.getenv("DATABASE_URL")    or st.secrets.get("DATABASE_URL", "")    # type: ignore[attr-defined]
-    if not monday_key:
-        raise RuntimeError("MONDAY_API_KEY is not set.")
     if not openai_key:
         raise RuntimeError("OPENAI_API_KEY is not set.")
     if not db_url:
         raise RuntimeError("DATABASE_URL is not set.")
 
     env = os.environ.copy()
-    env["MONDAY_API_KEY"] = monday_key
     env["OPENAI_API_KEY"] = openai_key
     env["DATABASE_URL"]   = db_url
 
     proc = subprocess.run(
-        [sys.executable, str(PIPELINE_SCRIPT),
-         str(config_path), str(inventory_path), "--since", since_date],
+        [sys.executable, str(PIPELINE_SCRIPT), str(inventory_path)],
         cwd=str(PRESALES_DIR), capture_output=True, text=True, env=env,
     )
     output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
@@ -216,24 +211,19 @@ def _sidebar(conn) -> tuple:
     with st.sidebar:
         st.header("Configuration")
 
-        config_path    = st.text_input("Config file",    value="monday_config.json")
         inventory_path = st.text_input("Inventory file", value="inventory.xlsx")
 
         st.divider()
         st.caption("API Keys")
-        mk = os.getenv("MONDAY_API_KEY") or st.secrets.get("MONDAY_API_KEY")  # type: ignore[attr-defined]
         ok = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")  # type: ignore[attr-defined]
         dk = os.getenv("DATABASE_URL")   or st.secrets.get("DATABASE_URL")    # type: ignore[attr-defined]
-        st.write("`MONDAY_API_KEY`:",  "✅ set" if mk else "❌ missing")
         st.write("`OPENAI_API_KEY`:",  "✅ set" if ok else "❌ missing")
         st.write("`DATABASE_URL`:",    "✅ set" if dk else "❌ missing")
 
         st.divider()
-        since_preview = _last_run_date(conn) or FIRST_RUN_SINCE
-        st.caption(f"Will pick up campaigns created on/after: **{since_preview}**")
-        run_clicked = st.button("▶ Run Pipeline", type="primary", use_container_width=True)
+        run_clicked = st.button("▶ Run Analysis", type="primary", use_container_width=True)
 
-    return config_path, inventory_path, run_clicked
+    return "monday_config.json", inventory_path, run_clicked
 
 
 # ---------------------------------------------------------------------------
